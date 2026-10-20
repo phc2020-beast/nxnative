@@ -42,6 +42,16 @@ class BuildError(Exception):
     pass
 
 
+def apple_silicon():   # the Mac's chip, not the Python's: hw.optional.arm64 is 1 on Apple silicon even under Rosetta (where platform.machine() says x86_64)
+    try: return subprocess.run(['sysctl', '-n', 'hw.optional.arm64'], capture_output=True, text=True).stdout.strip() == '1'
+    except OSError: return False
+
+
+def no_mac_host(what, out, g):   # an Intel Mac cannot boot the game in the Mac host (the game's own arm64 code runs natively there): the capture comes from an Apple silicon Mac
+    return BuildError(f'{what} boots the game in the Mac host, which needs an Apple silicon Mac; this Mac has an Intel chip. Run this script once for {g.id} on an Apple silicon Mac '
+                      f'(the capture is the same on every run), copy its {out.name}/ folder to {out} here, and run again: the capture is then reused (README.md, "On an Intel Mac")')
+
+
 def clock():
     return time.strftime('%H:%M:%S')
 
@@ -718,6 +728,7 @@ def capture_glslc(repo, dirs, pkg_ver, patched, work, env, logs, g):
         say(f'reusing the captured run-time shaders: {", ".join(str(d / "glslc_capture") for d in dirs.values())}')
         PROG.end('reused'); return
     if todo != [pkg_ver]: raise BuildError(f'the run-time shader capture runs the packed version {pkg_ver}\'s code; {", ".join(v for v in todo if v != pkg_ver)} needs a capture of its own')
+    if not apple_silicon(): PROG.end(ok=False); raise no_mac_host('the GLSLC capture', dirs[pkg_ver] / 'glslc_capture', g)
     PROG.set(step='building the Mac host')
     host = build_mac_host(repo, work / 'tools/dmhost', env, logs, g)
     d = dirs[pkg_ver]; cap, rd, log = d / 'glslc_capture.partial', work / 'tmp/glslc_run', logs / 'glslc_capture.log'
@@ -768,6 +779,7 @@ def capture_vk(repo, d, patched, work, env, logs, g):
     PROG.stage('Vulkan shader capture')
     if want and vk_done(out) >= want:
         say(f'reusing the captured run-time shaders: {out}'); PROG.end('reused'); return out
+    if not apple_silicon(): PROG.end(ok=False); raise no_mac_host('the Vulkan shader capture', out, g)
     PROG.set(step='building the Mac host')
     host = build_mac_host(repo, work / 'tools/dmhost', env, logs, g)
     cap, rd, log = d / 'vk_capture.partial', work / 'tmp/vk_run', logs / 'vk_capture.log'
@@ -966,7 +978,8 @@ def build_shaders(py, repo, sh, xlate, env, logs, g, provisional=False, split_ke
     rmtree(kf)
     try: PROG.watch(ShaderWatch(g, ios, Path(env['WORK'])))
     except Exception: pass   # progress never stops the build (a missing table is dmsh_build.py's to report)
-    run([py, repo / 'dm/gfx/tools/dmsh_build.py', sh / 'pkg', sh / 'cache'], log, env=dict(env, XLATE=str(xlate), IOSOUT=str(ios)))
+    intel = [] if apple_silicon() else [repo / 'dm/gfx/tools/intel_run.py']   # an Intel Mac: the translator's dll runs with dotnet (its apphost is arm64), spirv-cross is the Intel build
+    run([py, *intel, repo / 'dm/gfx/tools/dmsh_build.py', sh / 'pkg', sh / 'cache'], log, env=dict(env, XLATE=str(xlate), IOSOUT=str(ios)))
     PROG.watch(None)
     if provisional:
         PROG.set(step='c1 guard')
@@ -1144,6 +1157,7 @@ def main(args=None):
     env.update(DM_GAME=g.id, DM_ROOT=str(work), WORK=str(work / 'tmp'))
     logs = work / 'logs'
     check_prereqs(env, xlate)
+    if not apple_silicon(): say('Intel Mac: the iPhone app is cross-compiled as usual; the shader translator runs with dotnet, and steps that boot the game on the Mac are not available')
     picks = pick_nsps(fam, versions)
 
     ex = work / 'extract'; ex.mkdir(parents=True, exist_ok=True); (work / 'tmp').mkdir(exist_ok=True)
@@ -1152,6 +1166,7 @@ def main(args=None):
     glslc = gfx == 'nvn' and g.get('shader_glslc_capture', 'off') == 'on'   # shaders the game compiles at run time, captured in the Mac host (capture_glslc)
     vkcap = gfx == 'vulkan' and g.get('shader_vk_capture', 'off') == 'on'   # SPIR-V shaders the game generates at run time, captured in the Mac host (capture_vk)
     heapck = provisional and HEAP_CHECK and not args.no_heap_check and not heap_checked(g)   # the heap check, when the game needs one (once per provisional profile: it stamps the profile)
+    if heapck and not apple_silicon(): say('[RED] Intel Mac: no heap check (it boots the game in the Mac host, which needs Apple silicon); the alias / heap split stays a guess'); heapck = False
     PROG.plan(1 + len(versions) + bool(fam['dlc']) + glslc + vkcap + (5 if gfx == 'nvn' else 4))   # nx_extract, each version's extraction, the DLC, rewrite, the GLSLC / Vulkan capture, shader split + iOS shaders (or the Vulkan shaders), app build, IPA pack
     PROG.stage('build nx_extract')
     nx = build_nx_extract(repo, work, logs, env)
