@@ -6,6 +6,8 @@
 #   <dir>/dmsh_xlate ...        the translator's apphost is an arm64 executable, which an Intel Mac cannot start → dotnet <dir>/dmsh_xlate.dll ... (the same managed code: its dll fingerprints are unchanged)
 #   dmsh_chain.tools_now()      Homebrew's spirv-cross is another binary on Intel, so its file fingerprint never matches the lock (written on Apple silicon); the lock's value is taken instead,
 #                               with a note naming the installed spirv-cross revision. Every other fingerprint (translator dlls, Metal compilers) is still checked against the lock.
+#   DMSH_ANY_METAL=1            also takes the lock's Metal compiler versions in place of the installed ones (the NSP script's --any-metal: an Intel Mac that cannot run the Xcode the lock names,
+#                               macOS Sequoia's last being 26.3). The libraries are compiled from the same Metal source by an older compiler: not byte-identical to the reference build, not tested on a device
 import os, runpy, shutil, subprocess, sys
 
 _real = subprocess.run
@@ -23,11 +25,15 @@ def lock_spirv_cross(chain):
     real = chain.tools_now
     def tools_now():
         t = real()
-        want = dict(l.rstrip('\n').split('\t', 1) for l in open(chain.LOCK) if '\t' in l and not l.startswith('#')).get('spirv-cross')
+        lock = dict(l.rstrip('\n').split('\t', 1) for l in open(chain.LOCK) if '\t' in l and not l.startswith('#')); want = lock.get('spirv-cross')
         if want and t.get('spirv-cross') not in (want, 'missing'):
             r = _real(['spirv-cross', '--revision'], capture_output=True, text=True)
             print(f'intel_run: spirv-cross {" ".join((r.stdout + r.stderr).split())} is the Intel build: its file fingerprint is not compared with the lock (Apple silicon)', file=sys.stderr)
             t['spirv-cross'] = want
+        if os.environ.get('DMSH_ANY_METAL') == '1':
+            for k, v in lock.items():
+                if k.startswith('metal_') and t.get(k) not in (v, 'missing'):
+                    print(f'intel_run: {k} is {t[k]}, the lock names {v}: compiling with the installed one (DMSH_ANY_METAL)', file=sys.stderr); t[k] = v
         return t
     chain.tools_now = tools_now
 
