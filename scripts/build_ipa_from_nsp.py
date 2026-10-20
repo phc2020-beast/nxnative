@@ -1205,6 +1205,8 @@ def main(args=None):
     if not want_lang: raise BuildError(f'unknown game language {lang_in!r}; give one of {language_list([c for c, _ in nacp.LANGUAGES])}, by code or by name')
     env = dict(os.environ, PATH=os.pathsep.join(TOOL_PATHS + [os.environ.get('PATH', '/usr/bin:/bin:/usr/sbin:/sbin')]))
     if args.any_metal or ANY_METAL: env['DMSH_ANY_METAL'] = '1'; say('[RED] --any-metal: the shaders are compiled with the installed Metal compiler, not the version in dmsh_chain.lock')
+    dn = shutil.which('dotnet', path=env['PATH'])
+    if dn and 'DOTNET_ROOT' not in env: env['DOTNET_ROOT'] = str(Path(dn).resolve().parent)   # an apphost (nx_extract) looks only in /usr/local/share/dotnet without it: dotnet-install.sh puts the SDK in ~/.dotnet
     env.setdefault('USER', getpass.getuser())   # xcodegen fails without USER (Couldn't find current username)
     env.setdefault('J', str(os.cpu_count() or 8))   # shader_split.py's and dmsh_build.py's workers (their default is 8)
     py = sys.executable
