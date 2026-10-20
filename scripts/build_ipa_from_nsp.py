@@ -32,6 +32,7 @@ PROVISIONAL = False                     # build from a provisional profile even 
 HEAP_CHECK = True                       # a provisional profile whose game has virtual address memory and sets a heap: boot it on the Mac until its heap request (a few seconds) to size the heap region
 HEAP_CHECK_SECS = 30                    # the longest heap check (it stops at the first heap request, or HEAP_CHECK_NNMAIN_SECS into nnMain without one)
 HEAP_CHECK_NNMAIN_SECS = 5
+ANY_METAL = False                       # compile the shaders with the installed Metal compiler even when it is not the version dmsh_chain.lock names (an Intel Mac on macOS Sequoia, whose last Xcode is 26.3)
 
 PROGRESS = 'auto'                       # stage lines on the console: 'bar' (one line per stage, redrawn in place), 'lines' (a plain line every BEAT seconds), 'off' (only each stage's start and end); 'auto' = bar in a terminal or Spyder, lines when the output goes to a file
 BEAT = 30                               # seconds between progress lines in 'lines' mode
@@ -978,7 +979,7 @@ def build_shaders(py, repo, sh, xlate, env, logs, g, provisional=False, split_ke
     rmtree(kf)
     try: PROG.watch(ShaderWatch(g, ios, Path(env['WORK'])))
     except Exception: pass   # progress never stops the build (a missing table is dmsh_build.py's to report)
-    intel = [] if apple_silicon() else [repo / 'dm/gfx/tools/intel_run.py']   # an Intel Mac: the translator's dll runs with dotnet (its apphost is arm64), spirv-cross is the Intel build
+    intel = [] if apple_silicon() and env.get('DMSH_ANY_METAL') != '1' else [repo / 'dm/gfx/tools/intel_run.py']   # an Intel Mac: the translator's dll runs with dotnet (its apphost is arm64), spirv-cross is the Intel build; --any-metal: the installed Metal compiler
     run([py, *intel, repo / 'dm/gfx/tools/dmsh_build.py', sh / 'pkg', sh / 'cache'], log, env=dict(env, XLATE=str(xlate), IOSOUT=str(ios)))
     PROG.watch(None)
     if provisional:
@@ -1095,6 +1096,7 @@ def parse_args(argv):
     ap.add_argument('--profile-out', help='where the provisional profile goes (default: <NSP folder>/<title ID>_build/profile)')
     ap.add_argument('--provisional', action='store_true', help='build from a provisional profile even when dm/games has one for the game (tests the guesses)')
     ap.add_argument('--no-heap-check', action='store_true', help='a provisional profile: skip the heap check on the Mac (the alias / heap split stays a guess)')
+    ap.add_argument('--any-metal', action='store_true', help='compile the shaders with the installed Metal compiler even when dmsh_chain.lock names another version (an Intel Mac on macOS Sequoia: Xcode 26.3); not byte-identical to the reference build')
     ap.add_argument('--progress', choices=('auto', 'bar', 'lines', 'off'), help='stage lines on the console: bar = one line per stage, redrawn in place; lines = a plain line every BEAT seconds; off = only each stage\'s start and end '
                     '(default: the PROGRESS setting; auto = bar in a terminal or Spyder, lines when the output goes to a file or a pipe)')
     return ap.parse_args(argv)
@@ -1114,6 +1116,7 @@ def main(args=None):
     if not nsp_dir.is_dir(): raise BuildError(f'not a folder: {nsp_dir}')
     if not keys.is_file(): raise BuildError(f'no such file: {keys}')
     env = dict(os.environ, PATH=os.pathsep.join(TOOL_PATHS + [os.environ.get('PATH', '/usr/bin:/bin:/usr/sbin:/sbin')]))
+    if args.any_metal or ANY_METAL: env['DMSH_ANY_METAL'] = '1'; say('[RED] --any-metal: the shaders are compiled with the installed Metal compiler, not the version in dmsh_chain.lock')
     env.setdefault('USER', getpass.getuser())   # xcodegen fails without USER (Couldn't find current username)
     env.setdefault('J', str(os.cpu_count() or 8))   # shader_split.py's and dmsh_build.py's workers (their default is 8)
     py = sys.executable
