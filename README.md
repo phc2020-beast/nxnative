@@ -70,6 +70,16 @@ The IPA appears in the same folder (here `~/Games/MarioWonder/SMBWMobile.ipa`). 
 
 **4. Install** the IPA with your sideloading tool (AltStore, Sideloadly, LiveContainer, …). The app gets the game's name, icon and version (the update's version, for example 1.2.1 for Mario Wonder; the base game's when there is no update).
 
+### On an Intel Mac
+
+The same steps work on a Mac with an Intel chip: Xcode cross-compiles the iPhone app, and the script runs the shader translator with `dotnet` instead of its Apple silicon launcher (`dm/gfx/tools/intel_run.py`). You need:
+
+- **Xcode 26** (it needs macOS Sequoia 15.6 or later) with its Metal toolchain: `xcodebuild -downloadComponent MetalToolchain`.
+- **The Xcode the shader chain was built with.** `xcrun -sdk iphoneos metal --version` must print the version in `dm/gfx/tools/dmsh_chain.lock` (`metal_iphoneos`); otherwise the iOS shaders step stops with `translation chain tools do not match the lock file`. That is the same on Apple silicon.
+- **Homebrew in `/usr/local`** (Homebrew's Intel location) for `xcodegen`, `zstd`, `spirv-cross` and `dotnet-sdk`, installed with the commands in step 1. Homebrew's Intel `spirv-cross` is a different binary from the one in the lock, so the script names its version in the shader log instead of comparing it: keep it up to date with `brew upgrade spirv-cross`.
+
+Fire Emblem: Three Houses and Super Mario Galaxy also need shaders that the game makes while it runs, and the script captures them by booting the game on the Mac. That step needs Apple silicon, so on an Intel Mac the script stops and says which folder it needs. Run the script once for that game on an Apple silicon Mac, then copy `<id>_build/extract/<version>/glslc_capture` (Three Houses) or `vk_capture` (Galaxy) into the same place in your NSP folder and run the script again. The capture is the same on every run, so the script reuses it. The other games need nothing more. Running a game on the Mac itself ([docs/development.md](docs/development.md)) needs Apple silicon too.
+
 ## Play
 
 **Touch controls.** Tap **2D** / **3D** at the top to switch layouts; the app remembers your choice. Wonder, Engage, Dread, 13 Sentinels, Link's Awakening, Ace Attorney Investigations Collection, Unicorn Overlord, Rhythm Heaven Groove, Octopath Traveler 0, Pokémon Legends: Z-A, Cuphead, Absolum, Brain Memory Training Academy, The Great Ace Attorney Chronicles and STEINS;GATE RE:BOOT start in 2D, the other games in 3D (STEINS;GATE RE:BOOT's quick save is R3, in the 3D layout). In 3D, the right stick (the camera in most games) is not drawn: swipe on the right third of the screen, starting anywhere off the buttons. In Super Mario Galaxy and Super Mario Galaxy 2, other touches outside the controls move the pointer; in Captain Toad: Treasure Tracker they touch the game's screen (touch blocks, stun enemies).
