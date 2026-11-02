@@ -33,6 +33,7 @@ struct Game: Codable, Identifiable, Hashable {
     var mode: RenderMode = .handheld
     var texture: TextureDetail = .medium
     var showFPS = true
+    var players: String?
     var id: String { folder }
 }
 
@@ -69,6 +70,8 @@ final class Library: ObservableObject {
     var current: Game? { games.first { $0.id == selection } }
     var isBusy: Bool { run == .running }
     var bundleID: String? { info?.bundle_id }
+    /// One prod.keys serves every game: this game's pick, then any other game's, then where the backend found one.
+    var keys: String? { current?.keys ?? games.compactMap(\.keys).first ?? info?.keys }
 
     private func save() {
         try? FileManager.default.createDirectory(at: Self.store.deletingLastPathComponent(), withIntermediateDirectories: true)
@@ -142,7 +145,8 @@ final class Library: ObservableObject {
         var arguments = [game.folder, "--mode", game.mode.rawValue, "--texture-cap", String(game.texture.rawValue)]
         if game.showFPS { arguments.append("--fps") }
         if !team.isEmpty { arguments += ["--team", team] }
-        if let keys = game.keys { arguments += ["--keys", keys] }
+        if let keys { arguments += ["--keys", keys] }
+        if let players = game.players, !players.isEmpty { arguments += ["--players", players] }
         if let art = game.artwork { arguments += ["--art", art] }
         if install, let device { arguments += ["--device", device] }
         run = .running; stage = "Starting"; progress = nil; log = []; notice = nil
@@ -163,6 +167,17 @@ final class Library: ObservableObject {
     }
 
     func cancel() { building?.cancel(); stage = "Stopped"; run = .idle }
+
+    func backUpSaves() {
+        guard let game = current, let device, let bundleID else { return }
+        notice = "Copying saves from the Apple TV…"
+        Task {
+            do {
+                let backup = try await Backend.ask(SaveBackup.self, ["backup", game.folder, "--device", device, "--bundle", bundleID])
+                notice = backup.files == 0 ? "The Apple TV has no saves for this game yet." : backup.changed ? "\(backup.files) save files backed up to this Mac." : "The saves on this Mac are already up to date."
+            } catch { notice = error.localizedDescription }
+        }
+    }
 
     private func append(_ line: String) {
         log.append(line)

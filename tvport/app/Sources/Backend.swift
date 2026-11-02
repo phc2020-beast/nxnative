@@ -30,6 +30,14 @@ struct GameInfo: Codable {
     let team: String?
     let bundle_id: String?
     let signing: Signing?
+    let keys: String?
+    let last_backup: String?
+}
+
+struct SaveBackup: Codable {
+    let files: Int
+    let folder: String?
+    let changed: Bool
 }
 
 struct RunLog: Codable {

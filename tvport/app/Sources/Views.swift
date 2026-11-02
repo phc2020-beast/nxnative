@@ -75,6 +75,8 @@ struct GameView: View {
         .navigationTitle(library.current?.name ?? "TVPort")
         .toolbar {
             ToolbarItemGroup {
+                Button("Back Up Saves") { library.backUpSaves() }.disabled(library.bundleID == nil || library.device == nil || library.isBusy)
+                    .help("Copy this game's saves from the Apple TV to this Mac")
                 Button("Last Run") { library.diagnose() }.disabled(library.bundleID == nil || library.device == nil || library.isBusy)
                     .help("Read memory and frame times from the Apple TV")
                 Button("Open on TV") { library.launch() }.disabled(library.bundleID == nil || library.device == nil || library.isBusy)
@@ -90,7 +92,7 @@ struct GameView: View {
 
     private var canBuild: Bool {
         guard let info = library.info, library.device != nil else { return false }
-        return info.prepared || (!info.sources.isEmpty && library.current?.keys != nil)
+        return info.prepared || (!info.sources.isEmpty && library.keys != nil)
     }
 }
 
@@ -183,11 +185,17 @@ struct SettingsForm: View {
                 Text("The A15 has to store these textures uncompressed, so lower detail saves memory and shortens loading.").font(.caption).foregroundStyle(.secondary)
                 Toggle("Frame-rate counter", isOn: binding(\.showFPS))
             }
+            Section("Saves") {
+                TextField("Players", text: playersBinding, prompt: Text("Names, separated by commas"))
+                Text("With two or more names, the Apple TV asks who's playing, and each person gets their own saves. The first name picked keeps the saves already on the TV. Takes effect at the next Build & Install.")
+                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                if let last = library.info?.last_backup { LabeledContent("Last backup on this Mac", value: last) }
+            }
             if library.info?.prepared == false {
                 Section("First Build") {
                     LabeledContent("prod.keys") {
                         HStack {
-                            Text(library.current?.keys.map { URL(fileURLWithPath: $0).lastPathComponent } ?? "Not chosen").foregroundStyle(.secondary)
+                            Text(library.keys.map { URL(fileURLWithPath: $0).deletingLastPathComponent().lastPathComponent + "/prod.keys" } ?? "Not found").foregroundStyle(.secondary)
                             Button("Choose…") { choosingKeys = true }
                         }
                     }
@@ -198,6 +206,10 @@ struct SettingsForm: View {
         .fileImporter(isPresented: $choosingKeys, allowedContentTypes: [.data, .item]) { result in
             if case .success(let url) = result { library.update { $0.keys = url.path } }
         }
+    }
+
+    private var playersBinding: Binding<String> {
+        Binding(get: { library.current?.players ?? "" }, set: { value in library.update { $0.players = value } })
     }
 
     private func binding<T>(_ path: WritableKeyPath<Game, T>) -> Binding<T> {

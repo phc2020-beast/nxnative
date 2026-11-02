@@ -123,6 +123,136 @@ class ShaderList(unittest.TestCase):
             self.assertEqual((project / 'Gen/dm/pso_manifest.tsv').read_text(), '# header\n')
 
 
+class Saves(unittest.TestCase):
+    def test_only_committed_saves_count(self):
+        keep = ['save/File1.bin', 'save/sub/a.bin', 'save_device/x.bin', 'save.p-sam/File1.bin', 'save.p-sam-2_device/x.bin']
+        drop = ['save.work/File1.bin', 'save.new/File1.bin', 'save.sync', 'save.sync-tmp/out/x', 'save-backups/2026/save/File1.bin', 'save.p-sam.work/File1.bin', 'romfs.img', 'save/']
+        self.assertEqual([n for n in keep + drop if backend.SAVE_FILE.match(n)], keep)
+
+    def make_game(self, folder):
+        build = Path(folder) / '0100000000010000_build'
+        build.mkdir()
+        return backend.Game(Path(folder))
+
+    def fake_device(self, files, copied=None):
+        names, copied = list(files), copied if copied is not None else []
+
+        def fake_run(argv, **kwargs):
+            argv = [str(a) for a in argv]
+            if 'from' in argv:
+                source = argv[argv.index('--source') + 1].replace('Library/Caches/', '')
+                target = Path(argv[argv.index('--destination') + 1])
+                target.write_bytes(files[source])
+            else:
+                copied.append(argv[argv.index('--destination') + 1])
+            return type('R', (), {'returncode': 0, 'stderr': '', 'stdout': ''})()
+        return names, fake_run, copied
+
+    def test_backup_then_identical_backup_then_change(self):
+        files = {'save/File1.bin': b'one', 'save.p-sam/File1.bin': b'two'}
+        names, fake_run, _ = self.fake_device(files)
+        real_run, real_list = backend.run, backend.save_files
+        backend.run, backend.save_files = fake_run, lambda d, b: names
+        try:
+            with tempfile.TemporaryDirectory() as folder:
+                game = self.make_game(folder)
+                first = backend.backup_saves(game, 'd', 'b')
+                self.assertTrue(first['changed'])
+                self.assertEqual((Path(first['folder']) / 'save.p-sam/File1.bin').read_bytes(), b'two')
+                second = backend.backup_saves(game, 'd', 'b')
+                self.assertFalse(second['changed'])
+                self.assertEqual(len(list((game.build / 'save-backups').iterdir())), 1)
+                files['save/File1.bin'] = b'three'
+                self.assertTrue(backend.backup_saves(game, 'd', 'b')['changed'])   # in the same second as the first: it must not land on top of it
+                self.assertEqual(len(list((game.build / 'save-backups').iterdir())), 2)
+        finally:
+            backend.run, backend.save_files = real_run, real_list
+
+    def test_a_failed_copy_leaves_no_backup(self):
+        real_run, real_list = backend.run, backend.save_files
+        backend.run = lambda argv, **kwargs: type('R', (), {'returncode': 1, 'stderr': '', 'stdout': ''})()
+        backend.save_files = lambda d, b: ['save/File1.bin']
+        try:
+            with tempfile.TemporaryDirectory() as folder:
+                game = self.make_game(folder)
+                with self.assertRaises(backend.Failure):
+                    backend.backup_saves(game, 'd', 'b')
+                self.assertIsNone(backend.latest_backup(game))
+        finally:
+            backend.run, backend.save_files = real_run, real_list
+
+    def test_old_backups_are_trimmed(self):
+        with tempfile.TemporaryDirectory() as folder:
+            game = self.make_game(folder)
+            for i in range(backend.KEEP_BACKUPS):
+                old = game.build / f'save-backups/2020-01-{i:02d}/save'
+                old.mkdir(parents=True)
+                (old / 'File1.bin').write_bytes(b'old')
+            names, fake_run, _ = self.fake_device({'save/File1.bin': b'new'})
+            real_run, real_list = backend.run, backend.save_files
+            backend.run, backend.save_files = fake_run, lambda d, b: names
+            try:
+                backend.backup_saves(game, 'd', 'b')
+            finally:
+                backend.run, backend.save_files = real_run, real_list
+            kept = sorted(p.name for p in (game.build / 'save-backups').iterdir())
+            self.assertEqual(len(kept), backend.KEEP_BACKUPS)
+            self.assertNotIn('2020-01-00', kept)
+
+    def test_no_saves_on_the_tv_means_no_backup(self):
+        real = backend.save_files
+        backend.save_files = lambda d, b: []
+        try:
+            with tempfile.TemporaryDirectory() as folder:
+                self.assertEqual(backend.backup_saves(self.make_game(folder), 'd', 'b')['files'], 0)
+        finally:
+            backend.save_files = real
+
+    def test_restore_only_when_the_tv_has_lost_its_saves(self):
+        copied = []
+        _, fake_run, _ = self.fake_device({}, copied)
+        real_run, real_list = backend.run, backend.save_files
+        backend.run = fake_run
+        try:
+            with tempfile.TemporaryDirectory() as folder:
+                game = self.make_game(folder)
+                saved = game.build / 'save-backups/2026-11-02-150000/save'
+                saved.mkdir(parents=True)
+                (saved / 'File1.bin').write_bytes(b'x')
+                backend.save_files = lambda d, b: ['save/File1.bin']
+                self.assertEqual(backend.restore_saves(game, 'd', 'b'), 0)
+                self.assertEqual(copied, [])
+                backend.save_files = lambda d, b: []
+                self.assertEqual(backend.restore_saves(game, 'd', 'b'), 1)
+                self.assertEqual(copied, ['Library/Caches/save/File1.bin'])
+        finally:
+            backend.run, backend.save_files = real_run, real_list
+
+    def test_players_reach_the_app(self):
+        with tempfile.TemporaryDirectory() as folder:
+            game = self.make_game(folder)
+            self.assertIn('DM_TV_PLAYERS=Taylor, Sam\n', backend.write_env(game, 'handheld', 512, ' Taylor,  Sam ').read_text())
+            self.assertNotIn('DM_TV_PLAYERS', backend.write_env(game, 'handheld', 512, '').read_text())
+
+
+class FindKeys(unittest.TestCase):
+    def test_keys_beside_the_game_win(self):
+        with tempfile.TemporaryDirectory() as folder:
+            game = Path(folder) / 'Game'
+            game.mkdir()
+            (Path(folder) / 'prod.keys').write_text('x')
+            self.assertEqual(backend.find_keys(backend.Game(game)).name, 'prod.keys')
+
+
+class Launching(unittest.TestCase):
+    def test_finds_only_this_game(self):
+        listing = {'result': {'runningProcesses': [
+            {'processIdentifier': 7, 'executable': 'file:///private/var/containers/Bundle/Application/X/DmIOS.app/DmIOS'},
+            {'processIdentifier': 8, 'executable': 'file:///Applications/HeadBoard.app/HeadBoard'},
+            {'processIdentifier': 9}]}}
+        self.assertEqual(backend.running_pids(listing), [7])
+
+
 class Devices(unittest.TestCase):
     def test_keeps_real_apple_tvs_only(self):
         listing = {'result': {'devices': [

@@ -19,6 +19,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, Optional
@@ -31,6 +32,10 @@ SUPPORT = Path.home() / 'Library/Application Support'
 TEXTURE_CAPS = (0, 1024, 512, 256)
 CACHES = 'Library/Caches'
 SHADER_LIST = 'tvport-shaders.tsv'
+SAVE_BACKUPS = 'save-backups'
+KEEP_BACKUPS = 20
+LAUNCH_SETTLE_S = 3
+SAVE_FILE = re.compile(r'^save(\.p-[a-z0-9-]+)?(_device)?/.')   # each player's committed save; save.work, save.new and the like are working copies
 
 
 REASON = re.compile(r' error: |\[RED\]|FAIL: ')   # lines that say why a tool stopped; xcodebuild's own last lines only say that it did
@@ -248,7 +253,8 @@ def cmd_inspect(args) -> None:
     team = profile.get('team') or known_team()
     print(json.dumps({'folder': str(game.folder), 'title_id': game.title_id, 'name': game.name() if game.build else game.folder.name, 'version': game.version() if game.build else '',
                       'sources': game.sources, 'prepared': game.prepared, 'icon': str(game.icon) if game.icon else None, 'team': team,
-                      'bundle_id': game.bundle_id(team) if game.build and team else None, 'signing': profile, 'saved': game.state()}))
+                      'bundle_id': game.bundle_id(team) if game.build and team else None, 'signing': profile, 'saved': game.state(),
+                      'keys': str(find_keys(game) or '') or None, 'last_backup': latest_backup(game).name if latest_backup(game) else None}))
 
 
 def cmd_preview(args) -> None:
@@ -258,10 +264,82 @@ def cmd_preview(args) -> None:
     print(json.dumps({'preview': str(args.out)}))
 
 
-def write_env(game: Game, mode: str, texture_cap: int) -> Path:
+def find_keys(game: Game) -> Optional[Path]:
+    """prod.keys in the usual places, so one copy serves every game."""
+    for folder in (game.folder, game.folder.parent, Path.home() / 'Games', Path.home() / '.switch', Path.home() / 'Downloads', Path.home() / 'Desktop'):
+        keys = folder / 'prod.keys'
+        if keys.is_file():
+            return keys
+    return None
+
+
+def save_files(device: str, bundle: str) -> list:
+    """The committed saves on the TV, as paths under Library/Caches. An app that is not installed has none."""
+    try:
+        data = devicectl_json('device', 'info', 'files', '--device', device, '--domain-type', 'appDataContainer', '--domain-identifier', bundle, '--subdirectory', CACHES)
+    except (Failure, json.JSONDecodeError):
+        return []
+    return sorted(f['relativePath'] for f in data.get('result', {}).get('files', []) if SAVE_FILE.match(f.get('relativePath', '')) and not f.get('resources', {}).get('isDirectory'))
+
+
+def latest_backup(game: Game) -> Optional[Path]:
+    folders = sorted(p for p in (game.build / SAVE_BACKUPS).glob('*') if p.is_dir()) if game.build else []
+    return folders[-1] if folders else None
+
+
+def same_files(one: Path, other: Path) -> bool:
+    names = lambda root: sorted(str(p.relative_to(root)) for p in root.rglob('*') if p.is_file())
+    return names(one) == names(other) and all((one / n).read_bytes() == (other / n).read_bytes() for n in names(one))
+
+
+def backup_saves(game: Game, device: str, bundle: str) -> dict:
+    """Copies the TV's saves to the Mac, which survives what the TV's storage may not: an app deleted on the TV takes its preferences with it. Identical saves make no new backup."""
+    files = save_files(device, bundle)
+    if not files:
+        return {'files': 0, 'folder': None, 'changed': False}
+    incoming = game.build / '.save-backup-incoming'   # outside the backups, so a copy that fails partway is never taken for one
+    shutil.rmtree(incoming, ignore_errors=True)
+    for name in files:
+        (incoming / name).parent.mkdir(parents=True, exist_ok=True)
+        run(['xcrun', 'devicectl', 'device', 'copy', 'from', '--device', device, '--domain-type', 'appDataContainer', '--domain-identifier', bundle, '--source', f'{CACHES}/{name}', '--destination', incoming / name])
+        if not (incoming / name).is_file():
+            shutil.rmtree(incoming, ignore_errors=True)
+            raise Failure(f'Could not copy {name} from the Apple TV. Nothing was changed.')
+    newest = latest_backup(game)
+    if newest and same_files(incoming, newest):
+        shutil.rmtree(incoming)
+        return {'files': len(files), 'folder': str(newest), 'changed': False}
+    stamp, n = datetime.now().strftime('%Y-%m-%d-%H%M%S'), 1
+    target = game.build / SAVE_BACKUPS / stamp
+    while target.exists():
+        n += 1
+        target = game.build / SAVE_BACKUPS / f'{stamp}-{n}'
+    target.parent.mkdir(parents=True, exist_ok=True)
+    incoming.rename(target)
+    for old in sorted(p for p in target.parent.iterdir() if p.is_dir())[:-KEEP_BACKUPS]:
+        shutil.rmtree(old)
+    return {'files': len(files), 'folder': str(target), 'changed': True}
+
+
+def restore_saves(game: Game, device: str, bundle: str) -> int:
+    """Puts the newest backup back on a TV that has lost its saves. It never replaces a save that is there."""
+    backup = latest_backup(game)
+    if not backup or save_files(device, bundle):
+        return 0
+    names = [p for p in backup.rglob('*') if p.is_file() and SAVE_FILE.match(str(p.relative_to(backup)))]
+    for path in names:
+        result = run(['xcrun', 'devicectl', 'device', 'copy', 'to', '--device', device, '--domain-type', 'appDataContainer', '--domain-identifier', bundle, '--source', path, '--destination', f'{CACHES}/{path.relative_to(backup)}'])
+        if result.returncode:
+            raise Failure(f'Could not put {path.name} back on the Apple TV: {result.stderr.strip()[-300:]}')
+    return len(names)
+
+
+def write_env(game: Game, mode: str, texture_cap: int, players: str = '') -> Path:
     """The switches the app reads at launch (main.m, dm/env.txt)."""
     path = game.build / 'tvport-env.txt'
     lines = ['# Written by TVPort', f'DM_OPMODE={0 if mode == "handheld" else 1}', f'DM_BC_MAX_DIM={texture_cap}']
+    if players.strip():
+        lines.append('DM_TV_PLAYERS=' + ' '.join(players.split()))
     path.write_text('\n'.join(lines) + '\n')
     return path
 
@@ -288,7 +366,8 @@ def restore_tables(game: Game) -> None:
 def prepare_game(game: Game, keys: Optional[Path], team: str, python: str) -> Game:
     stage('Extracting the game, rewriting its code and building shaders')
     emit('log', line='This is the long step: 30 to 60 minutes the first time, and once per game.')
-    if not keys or not keys.is_file():
+    keys = keys if keys and keys.is_file() else find_keys(game)
+    if not keys:
         raise Failure('This game has not been built yet, so it needs your prod.keys file')
     command = [python, REPO / 'scripts/build_ipa_from_nsp.py', game.folder, '-k', keys, '--prepare-xcode', '--keep-extracted', '--gpu', 'none', '--romfs', 'separate', '--allow-other-metal', '--progress', 'lines']
     if team:
@@ -305,7 +384,7 @@ def generate_project(game: Game, args, team: str, bundle: str, python: str) -> P
     restore_tables(game)
     env = profile_env(game)
     env.update(GAME=game.title_id, W=str(game.build), PATCHED=str(game.build / f'patched_{game.package}'), ROMFS=str(game.romfs), MSL_IOS=str(game.shaders), AOC='',
-               DM_TVOS='1', DM_COPY_ROMFS='NO', DM_SHOW_FPS='1' if args.fps else '0', DM_ENV_FILE=str(write_env(game, args.mode, args.texture_cap)), DM_BUNDLE_ID=bundle, DM_TEAM_ID=team,
+               DM_TVOS='1', DM_COPY_ROMFS='NO', DM_SHOW_FPS='1' if args.fps else '0', DM_ENV_FILE=str(write_env(game, args.mode, args.texture_cap, args.players)), DM_BUNDLE_ID=bundle, DM_TEAM_ID=team,
                DM_XCODE_PROJECT_DIR=str(game.build / 'tvport-xcode'), DM_XCODE_DERIVED_DATA=str(game.build / 'tvport-derived'), FONT_PY=python)
     art = args.art or game.icon
     if art:
@@ -401,17 +480,41 @@ def cmd_build(args) -> None:
     bundle = game.bundle_id(team)
     if args.device:
         remember_shaders(game, args.device, bundle)
+        stage('Backing up saves to this Mac')
+        backup = backup_saves(game, args.device, bundle)
+        emit('log', line=f'{backup["files"]} save files backed up.' if backup['changed'] else 'The saves on this Mac are already up to date.' if backup['files'] else 'No saves on the Apple TV yet.')
     project = generate_project(game, args, team, bundle, python)
     bundle_shaders(game, project)
     compile_app(game, project, args.device)
     game.save_state(bundle_id=bundle, art=str(args.art) if args.art else None, mode=args.mode, texture_cap=args.texture_cap)
     if args.device:
         install(game, args.device, bundle)
+        restored = restore_saves(game, args.device, bundle)
+        if restored:
+            emit('log', line=f'The Apple TV had lost its saves: {restored} files put back from this Mac.')
     emit('done', bundle_id=bundle, app=str(game.app), signing=provisioning(game.app))
 
 
+def cmd_backup(args) -> None:
+    game = Game(args.folder)
+    if not game.build:
+        raise Failure('This game has not been built yet, so it has no saves.')
+    print(json.dumps(backup_saves(game, args.device, args.bundle)))
+
+
+def running_pids(listing: dict, executable: str = 'DmIOS') -> list:
+    return [p.get('processIdentifier') for p in listing.get('result', {}).get('runningProcesses', []) if f'/{executable}.app/' in str(p.get('executable', ''))]
+
+
 def cmd_launch(args) -> None:
-    result = run(['xcrun', 'devicectl', 'device', 'process', 'launch', '--device', args.device, '--terminate-existing', args.bundle])
+    # devicectl's --terminate-existing launches at once, and the Home screen coming back can then land on top of the new launch: tvOS suspends it during startup, which looks like a hang.
+    # So the old instance goes first, and the Home screen gets a moment to settle.
+    pids = running_pids(devicectl_json('device', 'info', 'processes', '--device', args.device))
+    for pid in pids:
+        run(['xcrun', 'devicectl', 'device', 'process', 'terminate', '--device', args.device, '--pid', pid])
+    if pids:
+        time.sleep(LAUNCH_SETTLE_S)
+    result = run(['xcrun', 'devicectl', 'device', 'process', 'launch', '--device', args.device, args.bundle])
     if result.returncode:
         message = result.stdout + result.stderr
         raise Failure('The Apple TV is asleep. Wake it with the remote, then try again.' if 'asleep' in message else message.strip()[-700:])
@@ -511,6 +614,11 @@ def main() -> int:
     build.add_argument('--mode', choices=('handheld', 'docked'), default='handheld')
     build.add_argument('--texture-cap', type=int, choices=TEXTURE_CAPS, default=512)
     build.add_argument('--fps', action='store_true')
+    build.add_argument('--players', default='')
+    backup = commands.add_parser('backup')
+    backup.add_argument('folder', type=Path)
+    backup.add_argument('--device', required=True)
+    backup.add_argument('--bundle', required=True)
     launch = commands.add_parser('launch')
     launch.add_argument('--device', required=True)
     launch.add_argument('--bundle', required=True)
@@ -519,7 +627,7 @@ def main() -> int:
     diagnose.add_argument('--bundle', required=True)
     args = parser.parse_args()
     try:
-        {'devices': cmd_devices, 'inspect': cmd_inspect, 'preview': cmd_preview, 'build': cmd_build, 'launch': cmd_launch, 'diagnose': cmd_diagnose}[args.command](args)
+        {'devices': cmd_devices, 'inspect': cmd_inspect, 'preview': cmd_preview, 'build': cmd_build, 'backup': cmd_backup, 'launch': cmd_launch, 'diagnose': cmd_diagnose}[args.command](args)
     except Failure as failure:
         if args.command == 'build':
             emit('error', message=str(failure))

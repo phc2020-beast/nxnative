@@ -73,11 +73,29 @@ To measure a run, pass the profiler at launch, because it starts before `env.txt
 xcrun devicectl device process launch --device <UDID> --terminate-existing -e '{"DM_MEMSTAT":"../Library/Caches/memstat.tsv"}' <bundle ID>
 ```
 
+## Saves
+
+tvOS has no lasting storage for files: on tvOS 27.2, `Documents` refuses writes and `Application Support` cannot be created, and `Library/Caches`, where the game keeps its saves, can be purged while the app is closed. Preferences do last. A save is mostly zeros, so it fits there: Super Mario Odyssey's 2 MB save packs to 9 KB.
+
+| Copy | Where | Survives |
+|---|---|---|
+| Working | `Library/Caches/save` on the TV | Until tvOS purges it |
+| Protected | The app's preferences, seconds after each save (`dm/ios/SourcesTV/TVSaves.m`) | A cache purge, a reinstall. Not deleting the app |
+| Backup | `<title ID>_build/save-backups` on this Mac, newest 20 | Anything that happens to the TV |
+
+The protected copy comes back by itself when the save folder is empty. Build & Install backs up to the Mac first, and puts the newest backup on a TV that has lost its saves. It never replaces a save that is there. **Back Up Saves** does the same copy to the Mac at any time.
+
+The preferences abort the app past about 1 MB, so TVSaves.m keeps them under 900 KB, and a save that would pass that goes to a plain file in `Library/Preferences`. That folder took a write in testing, but Apple does not promise to keep it. `NSUserDefaults` is the documented one.
+
+### Players
+
+Apple's way to give each Apple TV profile its own data is the User Management capability, which a free Apple ID cannot have: Xcode refuses it, so the app cannot see which profile is active. With two or more names in **Players**, the game asks "Who's playing?" before it starts, and each name gets its own saves (`dm/ios/SourcesTV/TVPlayers.m`). The first name ever picked keeps the save already on the TV, and a name keeps its saves for good, so renaming someone starts them fresh.
+
 ## Limits
 
 - **Memory:** the file-backed guest memory above is what keeps a game under the limit. Everything else, mainly textures and render targets, still counts toward 2,097 MB. The Increased Memory Limit entitlement is silently dropped for a free Apple ID on tvOS.
 - **Free Apple ID:** an install stops opening after 7 days. Build & Install renews it. Free accounts also have limits on apps and App IDs, so keep a game's bundle ID, which TVPort does for you.
-- **Saves and game files live in `Library/Caches`**, which tvOS may purge when storage runs low. Deleting the app on the TV removes them too. There is no backup yet.
+- **Game files live in `Library/Caches`**, which tvOS may purge when storage runs low. Build & Install sends them again. Saves are protected separately: see [Saves](#saves).
 - **First-use shader stalls.** The game records each shader on the TV, and each build copies that list to `tvport-shaders.tsv` beside the game and bundles it, so deleting the app does not lose it. A scene the game has never shown can still stall the first time.
 - **Back stays in the game.** The remote's Back and a controller's B do not leave it. Use the TV button.
 - **Launching needs an awake TV.** Installs work while it sleeps.

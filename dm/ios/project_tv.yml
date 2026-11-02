@@ -1,5 +1,5 @@
 # Apple TV project (xcodegen): project.yml for tvOS, chosen by build_ipa.sh with DM_TVOS=1. The Metal libraries stay iOS ones, which tvOS 27 loads, so the shader chain is unchanged.
-# No Launcher.swift (SourcesTV/tv_stubs.m), no file sharing and no orientations: tvOS has none of them.
+# No Launcher.swift (SourcesTV/TVPlayers.m starts the game instead), no iCloud (SourcesTV/TVSaves.m keeps saves in the preferences), no file sharing and no orientations.
 name: DmIOS
 options:
   bundleIdPrefix: ${DM_BUNDLE_ID}
@@ -14,7 +14,7 @@ targets:
     platform: tvOS
     sources:
       - path: Sources
-        excludes: [Info.plist, Launcher.swift, LauncherRow.swift, LauncherSettings.swift, DmIOS-Bridging-Header.h]
+        excludes: [Info.plist, Launcher.swift, LauncherRow.swift, LauncherSettings.swift, DmIOS-Bridging-Header.h, SaveSync.m, CloudSaves.m]
       - path: SourcesTV
       - path: Gen/embed.S
       - path: Gen/dm          # Rewriter tables (*.fixups.tsv / gates / cuts / obs) + shader map / c1 list / warm-up list
@@ -24,6 +24,8 @@ targets:
       - path: Gen/src         # Source files from the compile commands of dm/host/Makefile (linked in by tools/gen_build.py)
       - path: Gen/main/main.c
         compilerFlags: "-Dmain=dm_main"
+    dependencies:
+      - sdk: libcompression.tbd   # SourcesTV/TVSaves.m
     postBuildScripts:
       - name: Copy game resources
         script: /bin/bash "${SRCROOT}/tools/stage_resources.sh"
