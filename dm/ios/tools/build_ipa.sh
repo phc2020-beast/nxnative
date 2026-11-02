@@ -15,6 +15,7 @@
 #   DM_LANG=<language code> is the game language (DMLanguage in Info.plist, default en-US; DM_LANG in the app's Documents/env.txt overrides it on the phone);
 #   both are also the launcher's defaults (dm/launcher.json from dm/games/settings.py; the player's choice there wins over them, Documents/env.txt over the choice);
 #   the IPA name, code modules, RomFS marker and shader tables come from the game profile
+#   DM_TVOS=1 prepares the Apple TV project (project_tv.yml, with --prepare-xcode): DM_ICON becomes its layered icon and top shelf image (tools/tv_icon.swift). The Metal libraries stay iOS ones, which tvOS 27 loads, so the shader chain is unchanged
 set -u
 cd "$(dirname "$0")/.." || exit 1
 IOS_SOURCE=$PWD; IOS=$PWD; DM=$(cd .. && pwd)
@@ -45,7 +46,8 @@ if [ "$PREPARE_XCODE" = YES ]; then
   [ "$IOS" != "$IOS_SOURCE" ] || die "the per-game Xcode project must be outside dm/ios"
   # Source links follow repository edits; generated files and build products belong to this game only. Linked again each time: a project prepared from another checkout (a removed worktree) follows this one
   for item in Sources tools; do ln -sfn "$IOS_SOURCE/$item" "$IOS/$item" || die "link $item"; done
-  cp "$IOS_SOURCE/project.yml" "$IOS/project.yml" || die "copy project template"
+  if [ "${DM_TVOS:-0}" = 1 ]; then ln -sfn "$IOS_SOURCE/SourcesTV" "$IOS/SourcesTV" || die "link SourcesTV"; cp "$IOS_SOURCE/project_tv.yml" "$IOS/project.yml" || die "copy tvOS project template"
+  else cp "$IOS_SOURCE/project.yml" "$IOS/project.yml" || die "copy project template"; fi
   cd "$IOS" || die "cd $IOS"
   DM_SCHEME_NAME="$(echo "$DM_DISPLAY_NAME" | tr '/:' '__') ($GAME)"   # the scheme file is named after it
 
@@ -73,6 +75,7 @@ t "app: $DM_DISPLAY_NAME $DM_APP_VERSION ($DM_BUNDLE_ID), language $DM_LANG$([ $
 t "generate Gen/ (host sources, embedded modules, tables)"
 rm -rf Gen && mkdir -p Gen/dm || die "mkdir Gen"
 python3 tools/gen_build.py "$DM/host" Gen > Gen/dm.xcconfig || die "gen_build"
+if [ "${DM_TVOS:-0}" = 1 ]; then sed -i '' 's/ -framework IOKit//' Gen/dm.xcconfig || die "tvOS frameworks"; fi   # the tvOS SDK has no IOKit
 F=$(python3 tools/gen_embed.py "$PATCHED" Gen/embed.S $MODS) || die "gen_embed"
 echo "OTHER_LDFLAGS = \$(inherited) \$(DM_FRAMEWORKS) $F" >> Gen/dm.xcconfig
 cp "$PATCHED"/*.fixups.tsv "$PATCHED"/*.gates.tsv "$PATCHED"/*.cuts.tsv "$PATCHED"/*.obs.tsv Gen/dm/ || die "copy rewriter tables"
@@ -117,7 +120,11 @@ mkdir -p Gen/dm/font && cp "${STD_FONT:-/System/Library/Fonts/Supplemental/Arial
 # The catalog is always created (the project always lists it, see project.yml); without an icon it stays empty and DM_APPICON is not set
 ICON=${DM_ICON:-$(dirname "$ROMFS")/icon.jpg}
 mkdir -p Gen/Assets.xcassets && printf '{"info":{"author":"xcode","version":1}}\n' > Gen/Assets.xcassets/Contents.json || die "asset catalog"
-if [ -f "$ICON" ]; then
+if [ -f "$ICON" ] && [ "${DM_TVOS:-0}" = 1 ]; then
+  xcrun swift "$IOS_SOURCE/tools/tv_icon.swift" "$ICON" Gen/Assets.xcassets || die "tv_icon.swift: cannot make the Apple TV icon from $ICON"
+  echo "DM_APPICON = AppIcon" >> Gen/dm.xcconfig
+  t "Apple TV icon and top shelf image: $ICON"
+elif [ -f "$ICON" ]; then
   AI=Gen/Assets.xcassets/AppIcon.appiconset; mkdir -p "$AI" || die "mkdir $AI"
   sips -s format png -z 1024 1024 "$ICON" --out "$AI/icon.png" > /dev/null || die "sips: cannot convert the icon $ICON"
   printf '{"images":[{"filename":"icon.png","idiom":"universal","platform":"ios","size":"1024x1024"}],"info":{"author":"xcode","version":1}}\n' > "$AI/Contents.json"

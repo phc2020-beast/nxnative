@@ -10,6 +10,7 @@ DM_AUDIO	switch	`1` plays audio through Core Audio, `0` uses the silent sink; re
 DM_AUDIO_DUMP	diagnostic	`=<file>` writes every PCM block the game appends as is (16-bit, 48 kHz, channel count as in the OpenAudioOut log), to judge whether a sound played
 DM_AUDIO_MUTE	switch	`=1` runs the real Core Audio output path (callback pacing, background take-over) with the output silenced, for lifecycle tests on the Mac without noise
 DM_AUDREN_TRACE	diagnostic	When set, the CPU audio renderer logs every update with the number of frames rendered since the previous one
+DM_BC_MAX_DIM	player	`=<pixels>` on a GPU without BC formats: a 2D or 2D array BC texture with a mip chain drops its finest levels until its longest side fits; `0` or unset keeps them all
 DM_BOOTPROF	diagnostic	When set, logs boot timing: the loader's breakdown (mapping, relocation, probes), Metal library loading, pipeline creation, texture uploads and the first present
 DM_BUNDLE_ID	switch	Overrides the iOS app's bundle ID in `build_ipa.sh` (default `org.nxnative.<title ID in lowercase>`)
 DM_CHEATS	path	Folder of Atmosphère cheat files: `<folder>/<build ID>.txt` or an SD-card layout (`atmosphere/contents/<title ID>/cheats/`) under it (default `<DM_ROOT>/cheats`); the Mac menu lists and toggles them
@@ -56,6 +57,7 @@ DM_GL_STUBS	diagnostic	`=1` gives every GL function the layer lacks a stub that 
 DM_GPU_CAPTURE	diagnostic	`=<frame>[:<frames>]` or `gpu:<ms>[:<after frame>]` writes a Metal GPU trace of those frames for Xcode's Metal debugger; can be set while running through `DM_CTL`
 DM_GPU_CAPTURE_DIR	path	Folder for `DM_GPU_CAPTURE`'s traces (default `gpu_captures/` in the working directory)
 DM_GPU_CAPTURE_KEEP	diagnostic	Before each GPU capture, prunes the capture folder's `dm_*.gputrace` entries so that the newest `KEEP - 1` stay (default 2)
+DM_GUEST_FILE	switch	`0` keeps tvOS guest memory anonymous, inside the app's memory limit; by default it is a shared mapping of a sparse file, which the limit does not count
 DM_GUEST_SPAWN_TEST	diagnostic	`=1` runs a self-test before `nnMain`: a host-started guest thread does SDK malloc / free and locks an `nn::os` mutex, and the result is logged; `=2` also keeps a resident thread
 DM_HID_LOG	diagnostic	`1` logs the HID button usage number of each button pressed on a raw HID gamepad (`pad_hid_mac.h`), to write a `DM_HID_MAP`
 DM_HID_MAP	switch	`=<map>` such as `A=1,B=2,X=4,Y=5`: which HID button usage presses each Switch button on a raw HID gamepad (names A B X Y LS RS L R ZL ZR PLUS MINUS LEFT UP RIGHT DOWN; default 8BitDo's D-input numbering by position, `pad_hid.h`); Mac only
@@ -296,6 +298,7 @@ DM_TEST_KEYRACE	diagnostic	`=<n>` creates up to n (at most 512) pthread keys on 
 DM_TEST_KILL_AT	diagnostic	`=write:<n>` exits the process (`_exit(9)`) at the nth save write, imitating a kill mid-write
 DM_TEST_LEAK_GPU	diagnostic	`=1` allocates and keeps a 1 MB shared Metal buffer every 100 ticks: a GPU memory leak on demand
 DM_TEST_LINK_STALL	diagnostic	`=<start s>,<duration s>`: counting from the first present, pauses the display link at that point for that long, to check the present fallback
+DM_TEST_NO_BC	switch	Set: stores BC textures decompressed on any GPU, as a GPU without BC formats must
 DM_TEST_NO_METAL4	diagnostic	`=1` treats the GPU as one without Metal 4, as on a virtual Mac: the NVN layer starts only its classic part and drops every present
 DM_TEST_PRESENT_LAG	diagnostic	`=<every n>,<ms>[,<in a row>][;…]` sleeps that long before every nth present (and the ones after it in the run): a slow frame on demand
 DM_TEST_SWKBD_HOLD_MS	diagnostic	`=<ms>` (with `DM_KBD`) keeps the system keyboard up that long before `DM_KBD`'s text is returned, as a player typing would

@@ -2,6 +2,7 @@
 // with a TV connected the Metal view is on the TV and the phone shows the pad (DmTVSceneDelegate).
 // The host runs on the big-stack thread started by main.m; front_run runs the guest directly on the calling thread.
 #import <UIKit/UIKit.h>
+#import <GameController/GameController.h>
 #import <QuartzCore/CAMetalLayer.h>
 #import <Metal/Metal.h>
 #import <AVFAudio/AVFAudio.h>
@@ -58,7 +59,11 @@ static CGRect fit_16_9(CGRect b) {   // the largest centered 16:9 rectangle in b
 }
 static void tv_attach(void);
 
+#if TARGET_OS_TV
+@interface DmRootVC : GCEventViewController   // controllerUserInteractionEnabled off: a controller press reaches the game only, so its B does not also act as the remote's Back and leave for the Home screen
+#else
 @interface DmRootVC : UIViewController
+#endif
 @property (nonatomic, strong) DmGameView *game;
 @property (nonatomic, strong) UIView *pad;
 @property (nonatomic, strong) UILabel *fps;
@@ -67,6 +72,9 @@ static void tv_attach(void);
 - (void)startGame;
 @end
 static DmRootVC *g_root;
+#if TARGET_OS_TV
+static UITapGestureRecognizer *g_back_press;
+#endif
 static void launcher_done(void) { [g_root startGame]; }
 @implementation DmRootVC
 - (void)showHint:(NSString *)text {   // why the game cannot start, centered over the black screen
@@ -77,6 +85,9 @@ static void launcher_done(void) { [g_root startGame]; }
 }
 - (void)viewDidLoad {
     [super viewDidLoad];
+#if TARGET_OS_TV
+    self.controllerUserInteractionEnabled = NO;
+#endif
     self.view.backgroundColor = UIColor.blackColor;
     front_ios_power_watch();
     if (!front_ios_boot_ok()) {   // No game files: show a hint and do not start the host
@@ -84,7 +95,7 @@ static void launcher_done(void) { [g_root startGame]; }
         [self showHint:why ? [NSString stringWithFormat:@"Game files unusable.\n%s", why] : @"Game files not found.\nPut the RomFS folder into this App's Documents as \"romfs\" (Files app), then restart."]; return;
     }
     front_ios_audio_watch();
-#if defined(__IPHONE_27_0)   // compiled only with an SDK that has the scene accessory API
+#if defined(__IPHONE_27_0) && !TARGET_OS_TV   // compiled only with an SDK that has the scene accessory API
     if (@available(iOS 27.0, *)) {   // iOS 27 offers a TV scene only to a registered scene accessory, no longer from the Info.plist entry alone (that path stays for iOS 26)
         UISceneConfiguration *c = [[UISceneConfiguration alloc] initWithName:@"TV" sessionRole:UIWindowSceneSessionRoleExternalDisplayNonInteractive];
         c.delegateClass = NSClassFromString(@"DmTVSceneDelegate");
@@ -125,6 +136,14 @@ static void launcher_done(void) { [g_root startGame]; }
 }
 - (void)viewDidAppear:(BOOL)a {
     [super viewDidAppear:a];
+#if TARGET_OS_TV
+    [self becomeFirstResponder];
+    if (!g_back_press) {
+        g_back_press = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(backPressed:)];
+        g_back_press.allowedPressTypes = @[@(UIPressTypeMenu)];
+        [self.view.window addGestureRecognizer:g_back_press];
+    }
+#endif
     if (!front_ios_boot_ok() && front_ios_boot_message() && !self.presentedViewController) {   // a slim build whose game file image is missing or another version (main.m)
         UIAlertController *a = [UIAlertController alertControllerWithTitle:@"Game files" message:@(front_ios_boot_message()) preferredStyle:UIAlertControllerStyleAlert];
         [a addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
@@ -134,6 +153,16 @@ static void launcher_done(void) { [g_root startGame]; }
     self.launched = YES; g_root = self;
     if (!dm_show_launcher((__bridge void *)self, launcher_done)) [self startGame];   // the settings screen first (Launcher.swift), when the app has one
 }
+#if TARGET_OS_TV
+// tvOS leaves for the Home screen when nothing takes a Back press (the remote's Back, a controller's B), and suspends the app rather than ending it. GCEventViewController only stands in the way from inside the
+// responder chain, and this view holds nothing focusable, so this controller stays first responder and a recognizer on the window takes what arrives there. The TV button still leaves the game
+- (BOOL)canBecomeFirstResponder { return YES; }
+- (void)backPressed:(UITapGestureRecognizer *)g { (void)g; LOG("front end: a Back press stayed in the game"); }
+- (void)pressesBegan:(NSSet<UIPress *> *)presses withEvent:(UIPressesEvent *)event { (void)event; for (UIPress *p in presses) LOG("front end: press type %ld reached the app", (long)p.type); }
+- (void)pressesChanged:(NSSet<UIPress *> *)presses withEvent:(UIPressesEvent *)event { (void)presses; (void)event; }
+- (void)pressesEnded:(NSSet<UIPress *> *)presses withEvent:(UIPressesEvent *)event { (void)presses; (void)event; }
+- (void)pressesCancelled:(NSSet<UIPress *> *)presses withEvent:(UIPressesEvent *)event { (void)presses; (void)event; }
+#endif
 - (BOOL)prefersHomeIndicatorAutoHidden { return YES; }
 - (UIRectEdge)preferredScreenEdgesDeferringSystemGestures { return UIRectEdgeAll; }   // Edge gestures need two swipes, to avoid accidental exits
 - (BOOL)prefersStatusBarHidden { return YES; }
@@ -187,8 +216,10 @@ int dm_thermal_now(void) { return (int)NSProcessInfo.processInfo.thermalState; }
 int dm_low_power_now(void) { return NSProcessInfo.processInfo.lowPowerModeEnabled; }   // the frame step does not probe in it (hle_nvn.c fstep_cpu_slowed)
 double dm_brightness_now(void) { return g_brightness; }
 static void front_ios_power_watch(void) {
+#if !TARGET_OS_TV
     g_brightness = UIScreen.mainScreen.brightness;
     [NSNotificationCenter.defaultCenter addObserverForName:UIScreenBrightnessDidChangeNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *n) { (void)n; g_brightness = UIScreen.mainScreen.brightness; }];
+#endif
     [NSNotificationCenter.defaultCenter addObserverForName:NSProcessInfoThermalStateDidChangeNotification object:nil queue:nil usingBlock:^(NSNotification *n) {
         (void)n; LOG("front end: thermal state → %d (%.0f s after launch)", dm_thermal_now(), (now_ns() - g_t0_ns) / 1e9); }];
     [NSNotificationCenter.defaultCenter addObserverForName:NSProcessInfoPowerStateDidChangeNotification object:nil queue:nil usingBlock:^(NSNotification *n) {

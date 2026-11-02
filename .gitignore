@@ -11,3 +11,8 @@ dm/games/*/cb_extent.tsv
 .coverage
 .coverage.*
 /coverage.json
+
+# TVPort
+tvport/app/build/
+tvport/app/*.xcodeproj/
+tvport/app/Info.plist

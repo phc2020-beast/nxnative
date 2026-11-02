@@ -1,0 +1,26 @@
+# The TVPort Mac app. xcodegen generate, then build the TVPort scheme.
+name: TVPort
+options:
+  bundleIdPrefix: dev.tvport
+  deploymentTarget:
+    macOS: "14.0"
+targets:
+  TVPort:
+    type: application
+    platform: macOS
+    sources:
+      - Sources
+    info:
+      path: Info.plist
+      properties:
+        CFBundleDisplayName: TVPort
+        LSApplicationCategoryType: public.app-category.utilities
+        TVPortRoot: $(SRCROOT)/../..   # where backend.py and the engine are; the app is not sandboxed because it runs Xcode's tools
+    settings:
+      PRODUCT_BUNDLE_IDENTIFIER: dev.tvport.mac
+      SWIFT_VERSION: "5.0"
+      CODE_SIGN_IDENTITY: "-"
+      CODE_SIGN_STYLE: Manual
+      ENABLE_HARDENED_RUNTIME: NO
+      GENERATE_INFOPLIST_FILE: NO
+      MACOSX_DEPLOYMENT_TARGET: "14.0"

@@ -184,6 +184,9 @@ static void on_crash(int sig, siginfo_t *si, void *uc_) {
 }
 // The signal alternate stack is per thread: every guest thread must call this when it starts running (only then can the crash state be printed on the alternate stack on a stack overflow)
 // The alternate stack is released when the thread exits: the pthread key destructor is called at thread exit (disable the alternate stack first, then free). The game frequently starts short-lived threads, and without releasing each one leaks 64 KiB.
+#if TARGET_OS_TV   // tvOS has no sigaltstack: a crash handler runs on the thread's own stack, so a stack overflow goes unreported
+void crash_thread_init(void) {}
+#else
 static pthread_key_t g_altstack_key;
 static pthread_once_t g_altstack_once = PTHREAD_ONCE_INIT;
 static void altstack_free(void *p) { stack_t off = {.ss_flags = SS_DISABLE}; sigaltstack(&off, 0); free(p); }
@@ -194,6 +197,7 @@ void crash_thread_init(void) {
     stack_t ss = {.ss_sp = malloc(65536), .ss_size = 65536}; sigaltstack(&ss, 0);
     pthread_setspecific(g_altstack_key, ss.ss_sp);
 }
+#endif
 void crash_install(void) {
     crash_thread_init();
     struct sigaction sa = {.sa_sigaction = on_crash, .sa_flags = SA_SIGINFO | SA_ONSTACK};

@@ -1,6 +1,8 @@
 // Horizon kernel system calls (triggered by the SDK runtime once the SDK is loaded). Only what the P1 boot chain needs is implemented: memory layout + heap + query + debug output + timing.
 // Register convention: inputs w1.. / outputs w0=Result, x1=value (GetInfo / SetHeapSize), consistent with the public Horizon ABI.
 #include "dm.h"
+#include <TargetConditionals.h>
+#include <fcntl.h>
 #include <sys/mman.h>
 #include <errno.h>
 #include <unistd.h>
@@ -18,6 +20,24 @@
 // with an 8 GB reservation, builds from developer accounts that cannot sign that entitlement (free accounts) would exit at this step.
 #define RESERVE DM_GAME_MEM_RESERVE   // SMBW: the heap needs only 1.47 GB, so the block stays at 5 GB (the total proven on a real device; a single 6 GB block can be reserved, but Metal etc. still need address space)
 static uint8_t *g_as;              // ASLR region base = the whole block
+// tvOS ends an app at about 2.1 GB of footprint, and the Switch gives a game 3.2 GB of its own. Footprint counts anonymous memory, not file pages, so on tvOS the guest's memory is a shared mapping of a
+// sparse file: the system pages it out to flash under pressure, as a swap file, and it stays out of the limit. Measured on an A15: 3.5 GB written took the footprint from 4 to 6 MB, and read back correct
+// at 690 MB/s; mprotect, atomics, zero-copy Metal buffers and residency all work on it. The file loses its name at once, so the system takes its blocks back however the process ends. DM_GUEST_FILE=0 turns it off
+static void *guest_block(size_t size) {
+#if TARGET_OS_TV
+    const char *use = getenv("DM_GUEST_FILE");
+    if (!use || strcmp(use, "0")) {
+        char path[1024]; snprintf(path, sizeof path, "%s/Library/Caches/guest.bin", getenv("HOME"));
+        unlink(path);
+        int fd = open(path, O_RDWR | O_CREAT | O_EXCL, 0600);
+        void *m = MAP_FAILED;
+        if (fd >= 0) { unlink(path); if (!ftruncate(fd, (off_t)size)) m = mmap(NULL, size, PROT_NONE, MAP_SHARED, fd, 0); close(fd); }
+        if (m != MAP_FAILED) { LOG("guest memory: %zu MB backed by a file, outside the app's memory limit", size >> 20); return m; }
+        LOG("[RED] guest memory: no backing file (errno %d): anonymous memory, inside the app's memory limit", errno);
+    }
+#endif
+    return mmap(NULL, size, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
+}
 static size_t g_reserve;           // its size: RESERVE, or more with a DM_ALIAS_SIZE alias region
 static uint8_t *g_heap; static _Atomic size_t g_heap_cur; static size_t g_heap_cap;
 // The address range lies entirely within the currently opened (readable and writable) part of the guest heap: such reads need no kernel trap to check, memcpy directly (used where guest memory is read every tick, such as diag.c tk_rd)
@@ -50,7 +70,7 @@ static void mem_init_once(void) {
     size_t alias = DM_GAME_MEM_ALIAS; const char *as = getenv("DM_ALIAS_SIZE");
     if (as && *as) { alias = (size_t)strtoull(as, NULL, 0); if (alias < 0x10000000 || (alias & (pg - 1))) die("DM_ALIAS_SIZE %s: at least 256 MB, in whole host pages", as); }
     g_reserve = RESERVE - DM_GAME_MEM_ALIAS + alias;
-    g_as = mmap(NULL, g_reserve, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    g_as = guest_block(g_reserve);
     if (g_as == MAP_FAILED) die("reserve guest AS");
     // Fixed partition (all inside the reserved block): alias 2.875 GB, stack 256 MB, heap the remaining 1.625 GB.
     // In newer SDKs the AddressRegionManager always takes 0x3fe00000 (~1 GB) at the start of the alias region as its node area (sdk 0x134728) before handing out regions; with a 512 MB alias region the very first AllocateAddressRegion fails (0x1803).

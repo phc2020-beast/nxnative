@@ -15,7 +15,9 @@
 //   Shaking the phone shakes the controller (DM_BTN_SHAKE: its six-axis sensor, hle_hid.c), whichever controls are in use; see "Shaking the phone" below.
 #import <UIKit/UIKit.h>
 #import <GameController/GameController.h>
+#if !TARGET_OS_TV
 #import <CoreMotion/CoreMotion.h>
+#endif
 #import <CoreText/CoreText.h>
 #include <pthread.h>
 #include "dm.h"
@@ -41,6 +43,10 @@ static void publish(void) {   // the touch gamepad and the shake; the host ORs t
     pthread_mutex_unlock(&g_mu);
 }
 
+#if TARGET_OS_TV   // No accelerometer and no gyro in an Apple TV: motion comes from the physical controller
+static void motion_start(void) {}
+static void phone_motion_start(UIView *body) { (void)body; }
+#else
 // ---- Shaking the phone ----
 // The accelerometer at 60 Hz (no gyroscope, no permission prompt): gravity is followed by a slow low-pass (about 0.8 s), and a sample whose acceleration beyond it exceeds DM_SHAKE_G
 // (1.5 G by default; Documents/env.txt overrides) is a hit. The controller is shaken until 120 ms after the last hit: a flick is one shake (the host finishes it as a whole cycle)
@@ -104,6 +110,7 @@ static void phone_motion_start(UIView *body) {
     }];
 }
 
+#endif
 // ---- Layout constants (in u; x measured from the outer edge, the right half mirrors) ----
 static const CGFloat
     K_ZL_X = 44, K_ZL_Y = 40, K_ZL_R = 26,          // ZL / ZR: centre from the outer edge and the top, radius
@@ -143,7 +150,9 @@ static void pads_start(void);   // Physical controllers, below
     CAShapeLayer *_key[B_N]; CATextLayer *_label[B_N];   // one layer per key
     CAShapeLayer *_ring, *_knob;                   // the left stick (the right one is not drawn)
     CAShapeLayer *_swap; CATextLayer *_swapLabel; BOOL _swapHeld;
+#if !TARGET_OS_TV
     UIImpactFeedbackGenerator *_touchFeedback;       // one short feedback per touch-control press edge
+#endif
     unsigned _hapticSticks;
     BOOL _stickShown;                              // the left stick was held at the last refresh
     BOOL _full, _tap;                              // the 3D layout / the Tap layout is current
@@ -168,12 +177,17 @@ static BOOL fullOnly(int b) { return b == B_LS || b == B_RS || b >= B_LEFT; }   
 
 - (instancetype)initWithFrame:(CGRect)f {
     if ((self = [super initWithFrame:f])) {
-        self.multipleTouchEnabled = YES; self.opaque = NO; self.backgroundColor = UIColor.clearColor;
+#if !TARGET_OS_TV
+        self.multipleTouchEnabled = YES;
+#endif
+        self.opaque = NO; self.backgroundColor = UIColor.clearColor;
+#if !TARGET_OS_TV
         const char *feedback = getenv("DM_TOUCH_HAPTICS");
         if (!feedback || atoi(feedback)) {
             _touchFeedback = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight];
             [_touchFeedback prepare];
         }
+#endif
         _owner = [NSMapTable strongToStrongObjectsMapTable]; _faceOf = [NSMapTable strongToStrongObjectsMapTable];
         static dispatch_once_t once;
         dispatch_once(&once, ^{
@@ -302,7 +316,9 @@ static CGFloat dist(CGPoint a, CGPoint b) { return hypot(a.x - b.x, a.y - b.y); 
     uint64_t pressed = (face | dpad | btn) & ~(_faceBits | _dpadBits | _btnBits);
     unsigned gripping = (_stick[0] ? 1u : 0) | (_stick[1] ? 2u : 0);
     if (pressed || (swap && !_swapHeld) || (gripping & ~_hapticSticks)) {
+#if !TARGET_OS_TV
         [_touchFeedback impactOccurredWithIntensity:0.6]; [_touchFeedback prepare];
+#endif
     }
     _hapticSticks = gripping;
     _faceBits = face; _dpadBits = dpad; _btnBits = btn; _swapHeld = swap;
@@ -415,7 +431,9 @@ static void placeLabel(CATextLayer *t, CGPoint c, CGFloat fs) {
 
 - (void)layoutSubviews {
     [super layoutSubviews];
+#if !TARGET_OS_TV
     UIWindowScene *ws = self.window.windowScene; if (ws) atomic_store(&g_iface_orient, (int)ws.effectiveGeometry.interfaceOrientation);
+#endif
     CGFloat u = self.u;
     [CATransaction begin]; [CATransaction setDisableActions:YES];
     _controls.frame = self.layer.bounds;
@@ -524,7 +542,7 @@ static BOOL pads_slotted(GCController *gone) {
     GCController *c = note.object, *gone = [note.name isEqual:GCControllerDidDisconnectNotification] ? c : nil;
     if (c && (!c.extendedGamepad || g_merge)) LOG("controller %s: %s%s", gone ? "disconnected" : "connected", pad_name(c), c.extendedGamepad ? "" : " (no extended gamepad profile: not used)");
     BOOL any = g_merge ? pads_merged(gone) : pads_slotted(gone);
-    dispatch_async(dispatch_get_main_queue(), ^{ self->_padOff = any; self->_controls.hidden = any; [self reset]; });   // the touch gamepad hides while any controller is in use
+    dispatch_async(dispatch_get_main_queue(), ^{ self->_padOff = any; self->_controls.hidden = any || TARGET_OS_TV; [self reset]; });   // the touch gamepad hides while any controller is in use
 }
 @end
 
