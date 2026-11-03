@@ -32,12 +32,30 @@ struct GameInfo: Codable {
     let signing: Signing?
     let keys: String?
     let last_backup: String?
+    let last_backup_time: Double?
+    let last_backup_place: String?
 }
 
 struct SaveBackup: Codable {
     let files: Int
     let folder: String?
     let changed: Bool
+    let state: String?
+}
+
+/// One game in a round of automatic backups (backend.py autobackup).
+struct BackupStatus: Codable {
+    let state: String
+    var checked: Double?
+    let last_backup: String?
+    let last_backup_time: Double?
+    let last_backup_place: String?
+}
+
+struct BackupRound: Codable {
+    let state: String
+    let games: [String: BackupStatus]
+    let icloud: Bool
 }
 
 struct RunLog: Codable {
@@ -71,21 +89,60 @@ struct BackendError: LocalizedError {
     var errorDescription: String? { message }
 }
 
+struct Check: Codable, Hashable, Identifiable {
+    let name: String
+    let ok: Bool
+    let detail: String
+    let fix: String
+    let command: String
+    var id: String { name }
+}
+
+struct SetupReport: Codable {
+    let checks: [Check]
+    let ready: Bool
+    let needs_setup: Bool
+    let can_set_up: Bool
+}
+
 enum Backend {
-    /// Set at build time to the project folder (project.yml).
-    static var root: URL {
-        let value = Bundle.main.object(forInfoDictionaryKey: "TVPortRoot") as? String ?? ""
-        return URL(fileURLWithPath: value).standardizedFileURL
+    /// A packed app carries backend.py and the engine (scripts/package_tvport.py). An app built in the checkout runs them from there: TVPortRoot, set at build time (project.yml).
+    static var script: URL {
+        if let carried = Bundle.main.url(forResource: "backend", withExtension: "py") { return carried }
+        let root = Bundle.main.object(forInfoDictionaryKey: "TVPortRoot") as? String ?? ""
+        return URL(fileURLWithPath: root).appendingPathComponent("tvport/backend.py").standardizedFileURL
+    }
+
+    /// TVPort's own folder, which backend.py uses too. TVPORT_DATA moves both, for a test run.
+    static let data = ProcessInfo.processInfo.environment["TVPORT_DATA"].map { URL(fileURLWithPath: $0, isDirectory: true) }
+        ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("TVPort", isDirectory: true)
+
+    static let noXcode = "TVPort needs Xcode. Install it from the App Store and open it once."
+
+    /// /usr/bin/python3 and xcrun are only stubs until Xcode or its command line tools are installed, and starting one opens Apple's installer.
+    static var developerFolder: String? {
+        let p = Process()
+        let out = Pipe()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/xcode-select")
+        p.arguments = ["-p"]
+        p.standardOutput = out
+        p.standardError = FileHandle.nullDevice
+        guard (try? p.run()) != nil else { return nil }
+        let path = String(decoding: out.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+        p.waitUntilExit()
+        return p.terminationStatus == 0 && FileManager.default.fileExists(atPath: path) ? path : nil
     }
 
     private static func process(_ arguments: [String]) -> Process {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
-        p.arguments = [root.appendingPathComponent("tvport/backend.py").path] + arguments
-        p.currentDirectoryURL = root
+        p.arguments = [script.path] + arguments
+        p.currentDirectoryURL = script.deletingLastPathComponent()
         var environment = ProcessInfo.processInfo.environment
-        environment["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/local/share/dotnet:/usr/bin:/bin:/usr/sbin:/sbin"   // an app opened from Finder has no shell PATH: the engine needs xcodegen, dotnet and glslang
+        let dotnet = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".dotnet").path
+        environment["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/local/share/dotnet:\(dotnet):/usr/bin:/bin:/usr/sbin:/sbin"   // an app opened from Finder has no shell PATH: the engine needs xcodegen, dotnet and glslang
         environment["PYTHONUNBUFFERED"] = "1"
+        environment["TVPORT_DATA"] = data.path
         p.environment = environment
         return p
     }
@@ -93,6 +150,7 @@ enum Backend {
     /// A command that answers with one JSON object.
     static func ask<T: Decodable>(_ type: T.Type, _ arguments: [String]) async throws -> T {
         try await Task.detached(priority: .userInitiated) {
+            guard developerFolder != nil else { throw BackendError(message: noXcode) }
             let p = process(arguments)
             let out = Pipe()
             p.standardOutput = out
@@ -109,10 +167,10 @@ enum Backend {
         }.value
     }
 
-    /// `build`: events as they happen. Cancelling the task stops the build.
-    static func build(_ arguments: [String]) -> AsyncStream<BuildEvent> {
+    /// `build` or `setup`: events as they happen. Cancelling the task stops the command.
+    static func stream(_ arguments: [String]) -> AsyncStream<BuildEvent> {
         AsyncStream { continuation in
-            let p = process(["build"] + arguments)
+            let p = process(arguments)
             let out = Pipe()
             p.standardOutput = out
             p.standardError = out
@@ -124,6 +182,11 @@ enum Backend {
                 if data.isEmpty { handle.readabilityHandler = nil; reader.finish(); continuation.finish() } else { reader.add(data) }
             }
             continuation.onTermination = { _ in if p.isRunning { p.terminate() } }
+            guard developerFolder != nil else {
+                continuation.yield(.failed(noXcode))
+                continuation.finish()
+                return
+            }
             do { try p.run() } catch {
                 continuation.yield(.failed("Could not start the backend: \(error.localizedDescription)"))
                 continuation.finish()

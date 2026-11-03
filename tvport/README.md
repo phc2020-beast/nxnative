@@ -6,6 +6,10 @@ Tested hardware: Apple TV 4K (3rd generation, A15), tvOS 27.2, Xcode 27.2.
 
 ## Run it
 
+**The packed app:** unzip `TVPort-<version>.zip` and open TVPort.app from any folder. It is signed ad hoc and not notarized, so the first time macOS refuses it: open **System Settings > Privacy & Security** and press **Open Anyway**. At its first start it sets itself up (see [The packed app](#the-packed-app)) and lists anything else this Mac needs in **Setup**.
+
+**From this checkout**, which runs the checkout's own engine:
+
 ```bash
 cd tvport/app && xcodegen generate
 ```
@@ -18,13 +22,39 @@ xcodebuild -project tvport/app/TVPort.xcodeproj -scheme TVPort -configuration Re
 open tvport/app/build/Build/Products/Release/TVPort.app
 ```
 
+That build needs the project folder to stay where it was built, because it runs `tvport/backend.py` from there.
+
 Add a folder holding your game's `.nsp` or `.xci` files, pick your Apple TV, and press **Build & Install**. A first build takes 30 to 60 minutes and needs your `prod.keys`. After that a build takes a few minutes, because the game's rewritten code and shaders are kept in `<title ID>_build` beside the game.
 
 **Choose Artwork** takes any image. The preview is drawn by the same code as the real icon (`dm/ios/tools/tv_icon.swift`), which also makes the Top Shelf banners.
 
 **Last Run** reads the game's log and the system's memory reports from the Apple TV, and says what went wrong in plain words.
 
-The app needs the project folder to stay where it was built, because it runs `tvport/backend.py` from there.
+## The packed app
+
+`python3 scripts/package_tvport.py` makes `tvport/dist/TVPort.app` and `TVPort-<version>.zip` (about 50 MB), an app that runs on any Mac without this checkout. It carries:
+
+| In the app | What it is |
+|---|---|
+| `Contents/Resources/engine.tar.xz` | The engine: the tracked files of `dm/` and `scripts/` and `LICENSE`, 2,300 files, 300 MB unpacked. `engine.json` names its digest, commit and shader chain |
+| `Contents/Resources/backend.py`, `requirements.txt` | This folder's, unchanged |
+| `Contents/Helpers/uv` | [uv](https://github.com/astral-sh/uv), which makes the engine's Python |
+| `Contents/Resources/Licenses` | nxnative's MIT notice, the engine's third-party licenses and uv's. The About window says the same |
+
+At its first start the app unpacks the engine into `~/Library/Application Support/TVPort/engine/<digest>`, because the engine's tools write beside themselves and a signed app must not change. Then uv downloads Python 3.14 and the packages in `requirements.txt` into `python` and `venv` beside it: about 110 MB, a few seconds, and the only step that needs the internet. Nothing goes into `~/.local` or a shared cache.
+
+It cannot carry these, so **Setup** checks each and gives the command or the place to fix it:
+
+- **Xcode** with its tvOS and iOS platforms and the Metal toolchain. The shaders are iOS Metal libraries, so a tvOS build needs the iOS platform too.
+- **An Apple ID** signed in to Xcode (Settings > Accounts). A free one works, and TVPort finds its personal team itself.
+- **xcodegen, zstd and glslang** from Homebrew, and the **.NET SDK 10**, which builds the game extractor and runs the shader translator.
+- **Your own game dumps and `prod.keys`.** They stay in the folders you choose. TVPort reads the keys only during a first build.
+
+**Updates:** a new TVPort.app carries a new engine. Its first start unpacks that engine, and its first build removes the engines of earlier releases. The Python is made again only when `requirements.txt` changes. Games already built keep their `<title ID>_build`. A new shader chain rebuilds a game's shaders at its next build, which then needs `prod.keys` again. The app does not look for updates itself.
+
+**Never in the app:** game files, keys, built game apps, or anything a build makes. Only tracked files go into the engine, so a profile's shader tables from a game's build (`c1_full.tsv`, `cb_extent.tsv`), extracted files and builds in the checkout stay out. The script stops at a tracked file that looks like one of these, or that `.gitignore` says a build makes. It also leaves out `dm/tools/fuzz`, whose inputs are made-up game files. The game profiles nxnative publishes in `dm/games` are part of the engine. Built games must never be shared: each person builds from their own dumps.
+
+`TVPORT_DATA` moves the app's folder, for a test run.
 
 ## What differs from nxnative
 
@@ -81,9 +111,18 @@ tvOS has no lasting storage for files: on tvOS 27.2, `Documents` refuses writes 
 |---|---|---|
 | Working | `Library/Caches/save` on the TV | Until tvOS purges it |
 | Protected | The app's preferences, seconds after each save (`dm/ios/SourcesTV/TVSaves.m`) | A cache purge, a reinstall. Not deleting the app |
-| Backup | `<title ID>_build/save-backups` on this Mac, newest 20 | Anything that happens to the TV |
+| Backup | `<title ID>_build/save-backups` on this Mac, or iCloud Drive's `TVPort Saves/<title ID>`. Every 5 minutes while TVPort is open | Anything that happens to the TV |
 
-The protected copy comes back by itself when the save folder is empty. Build & Install backs up to the Mac first, and puts the newest backup on a TV that has lost its saves. It never replaces a save that is there. **Back Up Saves** does the same copy to the Mac at any time.
+The protected copy comes back by itself when the save folder is empty. Build & Install backs up first, and puts the newest backup on a TV that has lost its saves. It never replaces a save that is there. **Back Up Saves** makes the same copy at any time.
+
+### Automatic backups
+
+While TVPort is open it backs up every built game's saves from the selected Apple TV: once when it opens, then every 5 minutes, and every minute while the TV cannot be reached, so a round runs soon after the TV comes back. A round only lists the TV's files and copies from it, with `devicectl`. It never launches, ends or installs anything, so it does not disturb a game being played. It skips its turn while a build runs, because each build backs up first. A TV that is asleep or away, or a game that is not installed, makes no error: the round just ends. Each game in the list shows when its saves were last backed up.
+
+- **Cheap when nothing changed:** each backup keeps the TV's listing it was copied from (`tvport-manifest.json`: path, size and time of each file). A round lists the TV once per game and copies only when the listing differs. Then it takes about a second.
+- **Whole copies:** the game commits a save by swapping `save.work` into `save`, so a copy taken across that swap could mix old and new files. After copying, the round lists the TV again and throws the copy away if anything changed. The next round tries again.
+- **Kept:** the newest 20 backups, and the newest of each of the last 30 days. A copy identical to the newest backup makes no new one.
+- **iCloud Drive:** with **Keep backups in iCloud Drive** on, new backups go to `~/Library/Mobile Documents/com~apple~CloudDocs/TVPort Saves/<title ID>/`. A free Apple ID cannot give the tvOS app iCloud, so the Mac carries them there. If iCloud Drive is off, TVPort says so and keeps them beside the game. A restore takes the newest backup of both places.
 
 The preferences abort the app past about 1 MB, so TVSaves.m keeps them under 900 KB, and a save that would pass that goes to a plain file in `Library/Preferences`. That folder took a write in testing, but Apple does not promise to keep it. `NSUserDefaults` is the documented one. Animal Crossing's island always goes there: it is 24 MB of encrypted files that do not compress. Saves are stored with LZFSE, which takes a fraction of a second, and the copy starts as soon as the app stops being active, so closing it from the app switcher right after a save no longer loses the copy.
 
@@ -106,3 +145,5 @@ Apple's way to give each Apple TV profile its own data is the User Management ca
 ```bash
 python3 -I tvport/tests/test_backend.py
 ```
+
+They need no Apple TV, and they never touch `~/Library/Application Support/TVPort` or iCloud Drive.

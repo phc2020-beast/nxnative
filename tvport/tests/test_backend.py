@@ -1,4 +1,5 @@
 import json
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -89,7 +90,7 @@ class Failures(unittest.TestCase):
 class OneBuildAtATime(unittest.TestCase):
     def test_a_second_build_is_refused_and_the_lock_comes_back(self):
         with tempfile.TemporaryDirectory() as folder:
-            original, backend.SUPPORT = backend.SUPPORT, Path(folder)
+            original, backend.DATA = backend.DATA, Path(folder)
             try:
                 first = backend.one_build_at_a_time()
                 with self.assertRaises(backend.Failure):
@@ -97,7 +98,69 @@ class OneBuildAtATime(unittest.TestCase):
                 first.close()
                 backend.one_build_at_a_time().close()
             finally:
-                backend.SUPPORT = original
+                backend.DATA = original
+
+
+class Standalone(unittest.TestCase):
+    def make_bundle(self, folder, archive=None):
+        bundle, source = Path(folder) / 'Resources', Path(folder) / 'source'
+        (source / 'dm').mkdir(parents=True)
+        bundle.mkdir()
+        (source / 'dm/tool.py').write_text('print(1)\n')
+        (bundle / 'engine.json').write_text(json.dumps({'id': 'abc123'}))
+        if archive is None:
+            subprocess.run(['/usr/bin/tar', '-cJf', bundle / 'engine.tar.xz', '-C', source, 'dm'], check=True)
+        else:
+            (bundle / 'engine.tar.xz').write_bytes(archive)
+        return bundle
+
+    def test_the_engine_is_unpacked_once_and_earlier_ones_go(self):
+        with tempfile.TemporaryDirectory() as folder:
+            bundle, data = self.make_bundle(folder), Path(folder) / 'data'
+            engine = backend.unpack_engine(bundle, data)
+            self.assertEqual((engine / 'dm/tool.py').read_text(), 'print(1)\n')
+            self.assertEqual(json.loads((engine / 'engine.json').read_text())['id'], 'abc123')
+            (engine / 'dm/tool.py').write_text('changed by a build')
+            self.assertEqual(backend.unpack_engine(bundle, data), engine)
+            self.assertEqual((engine / 'dm/tool.py').read_text(), 'changed by a build')
+            (data / 'engine/older').mkdir()
+            backend.prune_engines(engine)
+            self.assertEqual(sorted(p.name for p in (data / 'engine').iterdir() if p.is_dir()), ['abc123'])
+
+    def test_a_broken_archive_leaves_no_engine(self):
+        with tempfile.TemporaryDirectory() as folder:
+            bundle, data = self.make_bundle(folder, archive=b'not an archive'), Path(folder) / 'data'
+            with self.assertRaises(backend.Failure):
+                backend.unpack_engine(bundle, data)
+            self.assertEqual([p.name for p in (data / 'engine').iterdir() if p.is_dir()], [])
+
+    def test_python_is_made_again_when_its_requirements_change(self):
+        with tempfile.TemporaryDirectory() as folder:
+            originals = backend.DATA, backend.REQUIREMENTS
+            backend.DATA, backend.REQUIREMENTS = Path(folder), Path(folder) / 'requirements.txt'
+            try:
+                backend.REQUIREMENTS.write_text('lz4==1\n')
+                self.assertFalse(backend.venv_ready())
+                (backend.DATA / 'venv/bin').mkdir(parents=True)
+                (backend.DATA / 'venv/bin/python3').write_text('')
+                (backend.DATA / 'venv/tvport-requirements.txt').write_text(backend.python_stamp())
+                self.assertTrue(backend.venv_ready())
+                backend.REQUIREMENTS.write_text('lz4==2\n')
+                self.assertFalse(backend.venv_ready())
+            finally:
+                backend.DATA, backend.REQUIREMENTS = originals
+
+    def test_the_personal_team_of_a_signed_in_apple_id_is_found(self):
+        prefs = {'IDEProvisioningTeamByIdentifier': {'account': [{'teamID': 'PAID123456', 'isFreeProvisioningTeam': False}, {'teamID': 'FREE123456', 'isFreeProvisioningTeam': True}]}}
+        self.assertEqual(backend.xcode_teams(prefs), ['FREE123456', 'PAID123456'])
+        self.assertEqual(backend.xcode_teams({}), [])
+
+    def test_the_app_never_carries_game_files(self):
+        sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'scripts'))
+        import package_tvport
+        bad = ['G/0100000000010000_build/extract/x.tsv', 'G/prod.keys', 'G/Game.nsp', 'dm/games/0100000000010000/c1_full.tsv', 'x/DmIOS.app/Info.plist', 'G/RomFS.img']
+        good = ['dm/games/0100000000010000/game.tsv', 'dm/tools/nacp.py', 'scripts/build_ipa_from_nsp.py', 'LICENSE']
+        self.assertEqual(package_tvport.unsafe(bad + good), bad)
 
 
 class ShaderList(unittest.TestCase):
@@ -123,7 +186,19 @@ class ShaderList(unittest.TestCase):
             self.assertEqual((project / 'Gen/dm/pso_manifest.tsv').read_text(), '# header\n')
 
 
+def listing(files):
+    """What the TV lists for these saves: a change of content changes the size here."""
+    return {name: [len(data), '2026-11-02T12:00:00.000Z'] for name, data in files.items()}
+
+
 class Saves(unittest.TestCase):
+    def setUp(self):
+        self.real_icloud = backend.ICLOUD
+        backend.ICLOUD = Path(tempfile.gettempdir()) / 'tvport-tests-no-icloud'   # iCloud Drive off, whatever this Mac has
+
+    def tearDown(self):
+        backend.ICLOUD = self.real_icloud
+
     def test_only_committed_saves_count(self):
         keep = ['save/File1.bin', 'save/sub/a.bin', 'save_device/x.bin', 'save.p-sam/File1.bin', 'save.p-sam-2_device/x.bin']
         drop = ['save.work/File1.bin', 'save.new/File1.bin', 'save.sync', 'save.sync-tmp/out/x', 'save-backups/2026/save/File1.bin', 'save.p-sam.work/File1.bin', 'romfs.img', 'save/']
@@ -150,9 +225,10 @@ class Saves(unittest.TestCase):
 
     def test_backup_then_identical_backup_then_change(self):
         files = {'save/File1.bin': b'one', 'save.p-sam/File1.bin': b'two'}
-        names, fake_run, _ = self.fake_device(files)
-        real_run, real_list = backend.run, backend.save_files
-        backend.run, backend.save_files = fake_run, lambda d, b: names
+        copies = []
+        _, fake_run, _ = self.fake_device(files)
+        real_run, real_list = backend.run, backend.save_listing
+        backend.run, backend.save_listing = lambda argv, **kw: copies.append(argv) or fake_run(argv, **kw), lambda d, b: listing(files)
         try:
             with tempfile.TemporaryDirectory() as folder:
                 game = self.make_game(folder)
@@ -160,18 +236,18 @@ class Saves(unittest.TestCase):
                 self.assertTrue(first['changed'])
                 self.assertEqual((Path(first['folder']) / 'save.p-sam/File1.bin').read_bytes(), b'two')
                 second = backend.backup_saves(game, 'd', 'b')
-                self.assertFalse(second['changed'])
+                self.assertEqual((second['changed'], second['state'], len(copies)), (False, 'unchanged', 2))   # the same listing: nothing copied
                 self.assertEqual(len(list((game.build / 'save-backups').iterdir())), 1)
                 files['save/File1.bin'] = b'three'
                 self.assertTrue(backend.backup_saves(game, 'd', 'b')['changed'])   # in the same second as the first: it must not land on top of it
                 self.assertEqual(len(list((game.build / 'save-backups').iterdir())), 2)
         finally:
-            backend.run, backend.save_files = real_run, real_list
+            backend.run, backend.save_listing = real_run, real_list
 
     def test_a_failed_copy_leaves_no_backup(self):
-        real_run, real_list = backend.run, backend.save_files
+        real_run, real_list = backend.run, backend.save_listing
         backend.run = lambda argv, **kwargs: type('R', (), {'returncode': 1, 'stderr': '', 'stdout': ''})()
-        backend.save_files = lambda d, b: ['save/File1.bin']
+        backend.save_listing = lambda d, b: listing({'save/File1.bin': b'x'})
         try:
             with tempfile.TemporaryDirectory() as folder:
                 game = self.make_game(folder)
@@ -179,7 +255,7 @@ class Saves(unittest.TestCase):
                     backend.backup_saves(game, 'd', 'b')
                 self.assertIsNone(backend.latest_backup(game))
         finally:
-            backend.run, backend.save_files = real_run, real_list
+            backend.run, backend.save_listing = real_run, real_list
 
     def test_old_backups_are_trimmed(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -188,25 +264,101 @@ class Saves(unittest.TestCase):
                 old = game.build / f'save-backups/2020-01-{i:02d}/save'
                 old.mkdir(parents=True)
                 (old / 'File1.bin').write_bytes(b'old')
-            names, fake_run, _ = self.fake_device({'save/File1.bin': b'new'})
-            real_run, real_list = backend.run, backend.save_files
-            backend.run, backend.save_files = fake_run, lambda d, b: names
+            _, fake_run, _ = self.fake_device({'save/File1.bin': b'new'})
+            real_run, real_list = backend.run, backend.save_listing
+            backend.run, backend.save_listing = fake_run, lambda d, b: listing({'save/File1.bin': b'new'})
             try:
                 backend.backup_saves(game, 'd', 'b')
             finally:
-                backend.run, backend.save_files = real_run, real_list
+                backend.run, backend.save_listing = real_run, real_list
             kept = sorted(p.name for p in (game.build / 'save-backups').iterdir())
             self.assertEqual(len(kept), backend.KEEP_BACKUPS)
             self.assertNotIn('2020-01-00', kept)
 
     def test_no_saves_on_the_tv_means_no_backup(self):
-        real = backend.save_files
-        backend.save_files = lambda d, b: []
+        real = backend.save_listing
         try:
             with tempfile.TemporaryDirectory() as folder:
-                self.assertEqual(backend.backup_saves(self.make_game(folder), 'd', 'b')['files'], 0)
+                game = self.make_game(folder)
+                backend.save_listing = lambda d, b: {}
+                self.assertEqual(backend.backup_saves(game, 'd', 'b')['state'], 'none')
+                backend.save_listing = lambda d, b: None
+                self.assertEqual(backend.backup_saves(game, 'd', 'b')['state'], 'unavailable')   # a TV that did not answer
         finally:
-            backend.save_files = real
+            backend.save_listing = real
+
+    def test_a_save_during_the_copy_is_thrown_away(self):
+        files = {'save/File1.bin': b'one'}
+        answers = [listing(files), listing({'save/File1.bin': b'newer'})]   # the game committed between the two listings
+        _, fake_run, _ = self.fake_device(files)
+        real_run, real_list = backend.run, backend.save_listing
+        backend.run, backend.save_listing = fake_run, lambda d, b: answers.pop(0) if answers else listing(files)
+        try:
+            with tempfile.TemporaryDirectory() as folder:
+                game = self.make_game(folder)
+                result = backend.backup_saves(game, 'd', 'b', attempts=1)
+                self.assertEqual(result['state'], 'busy')
+                self.assertIsNone(backend.latest_backup(game))
+                self.assertEqual([p.name for p in game.build.iterdir() if p.name.startswith('.save-backup-incoming')], [])
+        finally:
+            backend.run, backend.save_listing = real_run, real_list
+
+    def test_manifests_compare_size_and_time(self):
+        files = {'save/File1.bin': b'one'}
+        _, fake_run, _ = self.fake_device(files)
+        stamp = ['2026-11-02T12:00:00.000Z']
+        real_run, real_list = backend.run, backend.save_listing
+        backend.run, backend.save_listing = fake_run, lambda d, b: {'save/File1.bin': [len(files['save/File1.bin']), stamp[0]]}
+        try:
+            with tempfile.TemporaryDirectory() as folder:
+                game = self.make_game(folder)
+                first = backend.backup_saves(game, 'd', 'b')
+                self.assertEqual(backend.read_manifest(Path(first['folder'])), {'save/File1.bin': [3, stamp[0]]})
+                stamp[0] = '2026-11-02T12:05:00.000Z'   # written again with the same bytes: copied, compared, and no new backup
+                self.assertEqual(backend.backup_saves(game, 'd', 'b')['state'], 'unchanged')
+                self.assertEqual(backend.read_manifest(Path(first['folder'])), {'save/File1.bin': [3, stamp[0]]})
+                files['save/File1.bin'] = b'two'   # same size, new time, new bytes
+                stamp[0] = '2026-11-02T12:10:00.000Z'
+                self.assertEqual(backend.backup_saves(game, 'd', 'b')['state'], 'backed-up')
+        finally:
+            backend.run, backend.save_listing = real_run, real_list
+
+    def test_retention_keeps_twenty_and_one_a_day(self):
+        today = backend.datetime(2026, 11, 2).date()
+        recent = [f'2026-11-02-{h:02d}{m:02d}00' for h in range(10, 12) for m in range(0, 60, 5)]   # 24 rounds this morning
+        daily = [f'2026-10-{d:02d}-{t}' for d in range(5, 32) for t in ('080000', '200000')]
+        old = ['2026-10-03-200000', '2025-01-01-120000']
+        kept = backend.kept_backups(recent + daily + old + ['notes'], today)
+        self.assertEqual(sorted(kept)[-20:], recent[-20:])
+        self.assertEqual({n for n in kept if not n.startswith('2026-11-02')}, {f'2026-10-{d:02d}-200000' for d in range(5, 32)})   # 30 days back: the newest of each day
+        self.assertEqual(len(kept), 20 + 27)
+
+    def test_the_newest_backup_of_both_places_wins(self):
+        with tempfile.TemporaryDirectory() as folder:
+            game = self.make_game(folder)
+            mac, cloud = game.build / 'save-backups', Path(folder) / 'iCloud/TVPort Saves' / game.title_id
+            for place, name in ((mac, '2026-11-02-100000'), (mac, '2026-11-02-120000'), (cloud, '2026-11-02-110000'), (cloud, '2026-11-02-120000-2'), (cloud, '.2026-11-02-130000.partial')):
+                (place / name / 'save').mkdir(parents=True)
+            self.assertEqual(backend.latest_backup(game), mac / '2026-11-02-120000')   # iCloud Drive off: only this Mac's
+            backend.ICLOUD = Path(folder) / 'iCloud'
+            self.assertEqual(backend.latest_backup(game), cloud / '2026-11-02-120000-2')
+            self.assertEqual(backend.backup_time(backend.latest_backup(game)), backend.datetime(2026, 11, 2, 12).timestamp())
+
+    def test_icloud_backups_go_to_icloud_drive(self):
+        files = {'save/File1.bin': b'one'}
+        _, fake_run, _ = self.fake_device(files)
+        real_run, real_list = backend.run, backend.save_listing
+        backend.run, backend.save_listing = fake_run, lambda d, b: listing(files)
+        try:
+            with tempfile.TemporaryDirectory() as folder:
+                game = self.make_game(folder)
+                backend.ICLOUD = Path(folder) / 'iCloud'
+                backend.ICLOUD.mkdir()
+                result = backend.backup_saves(game, 'd', 'b', icloud=True)
+                self.assertEqual(Path(result['folder']).parent, backend.ICLOUD / 'TVPort Saves/0100000000010000')
+                self.assertFalse((game.build / 'save-backups').exists())
+        finally:
+            backend.run, backend.save_listing = real_run, real_list
 
     def test_restore_only_when_the_tv_has_lost_its_saves(self):
         copied = []

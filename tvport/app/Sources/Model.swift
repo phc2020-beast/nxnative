@@ -56,9 +56,21 @@ final class Library: ObservableObject {
     @Published var log: [String] = []
     @Published var diagnosis: Diagnosis?
     @Published var notice: String?
+    @Published var setup: SetupReport?
+    @Published var settingUp = false
+    @Published var setupStage = ""
+    @Published var setupFailure: String?
+    @Published var showingSetup = false
+    @Published var backups: [String: BackupStatus] = [:]
+    @Published var icloudBackups = UserDefaults.standard.bool(forKey: "BackUpToICloud") {
+        didSet { UserDefaults.standard.set(icloudBackups, forKey: "BackUpToICloud") }
+    }
+    @Published var icloudAvailable = true
     private var building: Task<Void, Never>?
+    private static let backupInterval: Double = 300
+    private static let retryInterval: Double = 60   // while the TV cannot be reached, so a round comes soon after it can
 
-    private static let store = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("TVPort/library.json")
+    private static let store = Backend.data.appendingPathComponent("library.json")
     private static let previews = FileManager.default.temporaryDirectory.appendingPathComponent("TVPortPreviews", isDirectory: true)
 
     init() {
@@ -68,7 +80,9 @@ final class Library: ObservableObject {
     }
 
     var current: Game? { games.first { $0.id == selection } }
-    var isBusy: Bool { run == .running }
+    var isBusy: Bool { run == .running || settingUp }
+    /// Unknown until the first check, which then does not hold anything back.
+    var setupMissing: [Check] { setup?.checks.filter { !$0.ok } ?? [] }
     var bundleID: String? { info?.bundle_id }
     /// One prod.keys serves every game: this game's pick, then any other game's, then where the backend found one.
     var keys: String? { current?.keys ?? games.compactMap(\.keys).first ?? info?.keys }
@@ -148,11 +162,12 @@ final class Library: ObservableObject {
         if let keys { arguments += ["--keys", keys] }
         if let players = game.players, !players.isEmpty { arguments += ["--players", players] }
         if let art = game.artwork { arguments += ["--art", art] }
+        if icloudBackups { arguments.append("--icloud") }
         if install, let device { arguments += ["--device", device] }
         run = .running; stage = "Starting"; progress = nil; log = []; notice = nil
         building = Task {
             var finished = false
-            for await event in Backend.build(arguments) {
+            for await event in Backend.stream(["build"] + arguments) {
                 switch event {
                 case .stage(let name): stage = name; progress = nil; append(name)
                 case .log(let line): append(line)
@@ -168,15 +183,86 @@ final class Library: ObservableObject {
 
     func cancel() { building?.cancel(); stage = "Stopped"; run = .idle }
 
+    /// What a build needs from this Mac. The first start of each release also unpacks the engine and makes its Python, without being asked.
+    func checkSetup() async {
+        guard Backend.developerFolder != nil else {
+            setup = SetupReport(checks: [Check(name: "Xcode", ok: false, detail: "Not installed", fix: "Install Xcode from the App Store, open it once, then press Check Again.", command: "")],
+                                ready: false, needs_setup: false, can_set_up: false)
+            showingSetup = true
+            return
+        }
+        do {
+            let report = try await Backend.ask(SetupReport.self, ["doctor"])
+            setup = report
+            if report.needs_setup && report.can_set_up && !settingUp && setupFailure == nil { runSetup() }
+        } catch { setupFailure = error.localizedDescription }
+    }
+
+    func runSetup() {
+        guard !settingUp, run != .running else { return }
+        settingUp = true; setupStage = "Starting"; setupFailure = nil
+        Task {
+            var failed: String?
+            for await event in Backend.stream(["setup"]) {
+                switch event {
+                case .stage(let name): setupStage = name; append(name)
+                case .log(let line): append(line)
+                case .failed(let message): failed = message
+                case .progress, .done: break
+                }
+            }
+            settingUp = false; setupStage = ""; setupFailure = failed
+            await checkSetup()
+        }
+    }
+
     func backUpSaves() {
         guard let game = current, let device, let bundleID else { return }
         notice = "Copying saves from the Apple TV…"
         Task {
             do {
-                let backup = try await Backend.ask(SaveBackup.self, ["backup", game.folder, "--device", device, "--bundle", bundleID])
-                notice = backup.files == 0 ? "The Apple TV has no saves for this game yet." : backup.changed ? "\(backup.files) save files backed up to this Mac." : "The saves on this Mac are already up to date."
+                let backup = try await Backend.ask(SaveBackup.self, ["backup", game.folder, "--device", device, "--bundle", bundleID] + (icloudBackups ? ["--icloud"] : []))
+                switch backup.state {
+                case "unavailable": notice = "The Apple TV did not answer. Wake it with the remote, then try again."
+                case "busy": notice = "The game was saving during each copy. Try again in a moment."
+                default: notice = backup.files == 0 ? "The Apple TV has no saves for this game yet." : backup.changed ? "\(backup.files) save files backed up." : "The backup is already up to date."
+                }
+                await refresh()
             } catch { notice = error.localizedDescription }
         }
+    }
+
+    /// While the app is open: a round when it opens, then every few minutes, and soon after the TV can be reached again.
+    func backUpEveryFewMinutes() async {
+        while !Task.isCancelled {
+            let wait = await backUpRound()
+            try? await Task.sleep(for: .seconds(wait))
+        }
+    }
+
+    /// One round of automatic backups of every built game. It only reads the TV (backend.py autobackup), and is quiet when the TV is asleep or away, or the game is not installed.
+    private func backUpRound() async -> Double {
+        if devices.isEmpty { await refreshDevices() }
+        let folders = games.filter { !$0.titleID.isEmpty }.map(\.folder)
+        guard let device else { return Self.retryInterval }
+        guard !folders.isEmpty, run != .running else { return Self.backupInterval }   // a build backs up first anyway
+        let arguments = ["autobackup", "--device", device] + folders.flatMap { ["--folder", $0] } + (icloudBackups ? ["--icloud"] : [])
+        guard let round = try? await Backend.ask(BackupRound.self, arguments) else { return Self.backupInterval }
+        icloudAvailable = round.icloud
+        for (folder, var status) in round.games {
+            status.checked = status.checked ?? backups[folder]?.checked   // a round that could not ask keeps the last time the copy matched the TV
+            backups[folder] = status
+        }
+        return round.state == "unreachable" ? Self.retryInterval : Self.backupInterval
+    }
+
+    /// When the Mac's copy of a game's saves last matched the TV, or when its newest backup was made.
+    func backedUp(_ game: Game) -> String? {
+        let status = backups[game.folder]
+        let time = status?.checked ?? status?.last_backup_time ?? (game.id == selection ? info?.last_backup_time : nil)
+        guard let time else { return nil }
+        let date = Date(timeIntervalSince1970: time)
+        return Calendar.current.isDateInToday(date) ? date.formatted(date: .omitted, time: .shortened) : date.formatted(date: .abbreviated, time: .shortened)
     }
 
     private func append(_ line: String) {

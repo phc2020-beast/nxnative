@@ -6,6 +6,9 @@ a stream of one object per line, {"event": "stage" | "log" | "progress" | "error
 
 The game goes through nxnative as usual (scripts/build_ipa_from_nsp.py makes <title ID>_build: rewritten modules and shaders), then
 build_ipa.sh with DM_TVOS=1 makes a separate tvOS project beside them. A build folder from an earlier run is reused, so only the first build of a game takes long.
+
+In a checkout this file runs the engine around it. In TVPort.app (scripts/package_tvport.py) the engine comes as an archive beside this file, with engine.json, and `setup`
+unpacks it into TVPort's own folder and makes the Python it needs there.
 """
 from __future__ import annotations
 
@@ -20,20 +23,32 @@ import subprocess
 import sys
 import tempfile
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterable, Optional
 
-REPO = Path(__file__).resolve().parent.parent
+HERE = Path(__file__).resolve().parent
+BUNDLED = (HERE / 'engine.json').is_file()
+REPO = HERE.parent   # the engine: this checkout, or for the app the copy it unpacked (main)
 TITLE_RE = re.compile(r'^([0-9A-Fa-f]{16})_build$')
 SOURCE_SUFFIXES = {'.nsp', '.xci', '.nsz', '.xcz'}
 ENGINE_PACKAGES = ('fontTools', 'capstone', 'lz4')
 SUPPORT = Path.home() / 'Library/Application Support'
+DATA = Path(os.environ.get('TVPORT_DATA') or SUPPORT / 'TVPort')   # the app's library, the build lock, and the app's engine and Python; TVPORT_DATA moves it, for a test run
+PYTHON_VERSION = '3.14'
+REQUIREMENTS = HERE / 'requirements.txt'
+TOOL_PATHS = ['/opt/homebrew/bin', '/usr/local/bin', '/usr/local/share/dotnet', str(Path.home() / '.dotnet')]   # where the NSP script looks too
 TEXTURE_CAPS = (0, 1024, 512, 256)
 CACHES = 'Library/Caches'
 SHADER_LIST = 'tvport-shaders.tsv'
 SAVE_BACKUPS = 'save-backups'
-KEEP_BACKUPS = 20
+KEEP_BACKUPS = 20   # the newest backups, whatever their age,
+KEEP_DAYS = 30      # and the newest of each day for this many days: a backup every few minutes would otherwise reach back barely an hour
+BACKUP_NAME = re.compile(r'^\d{4}-\d{2}-\d{2}')   # a backup folder: the local time it was made, so names sort by age
+MANIFEST = 'tvport-manifest.json'   # the TV's listing a backup was copied from
+ICLOUD = Path.home() / 'Library/Mobile Documents/com~apple~CloudDocs'
+ICLOUD_SAVES = 'TVPort Saves'
+TV_TIMEOUT_S = 60
 LAUNCH_SETTLE_S = 3
 SAVE_FILE = re.compile(r'^save(\.p-[a-z0-9-]+)?(_device)?/.')   # each player's committed save; save.work, save.new and the like are working copies
 
@@ -75,14 +90,92 @@ def stream(argv: Iterable, *, env=None, cwd=None, on_line=None, log_filter=None)
         raise Failure('\n'.join(reasons or tail[-6:])[-1500:])
 
 
-def engine_python() -> str:
-    """An interpreter with the engine's packages: this project's own environment, then the one NX Play installed, then the system's."""
-    candidates = [SUPPORT / 'TVPort/venv/bin/python3', SUPPORT / 'NX Play/venv/bin/python3', Path('/opt/homebrew/bin/python3'), Path(shutil.which('python3') or 'python3')]
-    probe = '; '.join(f'import {p}' for p in ENGINE_PACKAGES)
+def python_stamp() -> str:
+    """What TVPort's own environment was made from: a new release that changes it makes it again."""
+    return f'python {PYTHON_VERSION}\n' + REQUIREMENTS.read_text()
+
+
+def venv_ready() -> bool:
+    stamp = DATA / 'venv/tvport-requirements.txt'
+    return (DATA / 'venv/bin/python3').exists() and stamp.is_file() and stamp.read_text() == python_stamp()
+
+
+def borrowed_python() -> Optional[str]:
+    """An interpreter with the engine's packages, 3.12 or newer (the NSP script's minimum): TVPort's own environment, then the one NX Play installed, then Homebrew's or the system's."""
+    candidates = ([DATA / 'venv/bin/python3'] if venv_ready() else []) + [SUPPORT / 'NX Play/venv/bin/python3', Path('/opt/homebrew/bin/python3'), Path(shutil.which('python3') or 'python3')]
+    probe = 'import sys; assert sys.version_info >= (3, 12); ' + '; '.join(f'import {p}' for p in ENGINE_PACKAGES)
     for python in candidates:
         if python.exists() and run([python, '-c', probe]).returncode == 0:
             return str(python)
-    raise Failure('No Python with fontTools, capstone and lz4. In Terminal: python3 -m pip install lz4 "capstone>=5,<6" fonttools nsz zbic')
+    return None
+
+
+def engine_python() -> str:
+    python = borrowed_python()
+    if python:
+        return python
+    if uv_tool():
+        return set_up_python()
+    raise Failure(f'No Python {PYTHON_VERSION} with the engine\'s packages, and no uv to make one. In Terminal: brew install uv, then press Set Up in TVPort.')
+
+
+def uv_tool() -> Optional[str]:
+    """uv makes TVPort's Python: the app carries one (Contents/Helpers), a checkout takes Homebrew's."""
+    carried = HERE.parent / 'Helpers/uv'
+    return str(carried) if carried.is_file() else shutil.which('uv', path=os.pathsep.join(TOOL_PATHS + [os.environ.get('PATH', '')]))
+
+
+def set_up_python() -> str:
+    """TVPort's own Python and the engine's packages at the versions requirements.txt names, all inside TVPort's folder: uv puts nothing in ~/.local or a cache outside it.
+    The download needs the internet, once per release that changes them."""
+    uv, venv = uv_tool(), DATA / 'venv'
+    if not uv:
+        raise Failure('uv is missing, so TVPort cannot make its Python. In Terminal: brew install uv')
+    DATA.mkdir(parents=True, exist_ok=True)
+    env = dict(os.environ, UV_PYTHON_INSTALL_DIR=str(DATA / 'python'), UV_NO_CONFIG='1', UV_NO_CACHE='1', UV_NO_PROJECT='1', UV_PYTHON_PREFERENCE='only-managed')
+    env.pop('VIRTUAL_ENV', None)
+    try:
+        stage(f'Downloading Python {PYTHON_VERSION} for the engine')
+        stream([uv, 'python', 'install', PYTHON_VERSION, '--no-bin'], env=env, cwd=DATA)
+        stage('Installing the engine\'s Python packages')
+        stream([uv, 'venv', '--clear', '--python', PYTHON_VERSION, venv], env=env, cwd=DATA)
+        stream([uv, 'pip', 'install', '--python', venv / 'bin/python3', '-r', REQUIREMENTS], env=env, cwd=DATA)
+    except Failure as failure:
+        raise Failure(f'TVPort could not set up its Python. It needs the internet the first time.\n{failure}') from failure
+    (venv / 'tvport-requirements.txt').write_text(python_stamp())
+    return str(venv / 'bin/python3')
+
+
+def unpack_engine(bundle: Path, data: Path) -> Path:
+    """The engine the app carries, unpacked once per release into TVPort's folder: its tools write beside themselves (a profile's shader tables, the extractor's build files), which a
+    signed app must not do to itself. Another command of the app may be unpacking it at the same moment, so the second waits for the first."""
+    engine_id = json.loads((bundle / 'engine.json').read_text())['id']
+    root = data / 'engine'
+    target = root / engine_id
+    if target.is_dir():
+        return target
+    root.mkdir(parents=True, exist_ok=True)
+    with (root / '.lock').open('w') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if target.is_dir():
+            return target
+        partial = root / f'.{engine_id}.partial'
+        shutil.rmtree(partial, ignore_errors=True)
+        partial.mkdir()
+        result = run(['/usr/bin/tar', '-xf', bundle / 'engine.tar.xz', '-C', partial])
+        if result.returncode:
+            shutil.rmtree(partial, ignore_errors=True)
+            raise Failure(f'The engine TVPort carries could not be unpacked into {root}: {result.stderr.strip()[-500:]}')
+        shutil.copy2(bundle / 'engine.json', partial / 'engine.json')
+        partial.rename(target)
+    return target
+
+
+def prune_engines(keep: Path) -> None:
+    """Earlier releases' engines. Called while holding the build lock, so no build is using one."""
+    for old in keep.parent.iterdir():
+        if old.is_dir() and old != keep:
+            shutil.rmtree(old, ignore_errors=True)
 
 
 def chain() -> str:
@@ -203,6 +296,12 @@ def provisioning(app: Optional[Path]) -> dict:
             'free_team': bool(data.get('LocalProvision')) or (expires - data['CreationDate'].replace(tzinfo=timezone.utc)).days <= 7}
 
 
+def xcode_teams(prefs: dict) -> list:
+    """The teams of the Apple IDs signed in to Xcode (Settings > Accounts), personal teams first: a free Apple ID that has never built anything has no profile yet, only this."""
+    teams = [team for account in prefs.get('IDEProvisioningTeamByIdentifier', {}).values() for team in account if team.get('teamID')]
+    return [team['teamID'] for team in sorted(teams, key=lambda team: not team.get('isFreeProvisioningTeam'))]
+
+
 def known_team() -> str:
     folders = [Path.home() / 'Library/Developer/Xcode/UserData/Provisioning Profiles', Path.home() / 'Library/MobileDevice/Provisioning Profiles']
     for folder in folders:
@@ -210,13 +309,21 @@ def known_team() -> str:
             decoded = run(['security', 'cms', '-D', '-i', profile])
             if decoded.returncode == 0:
                 return plistlib.loads(decoded.stdout.encode())['TeamIdentifier'][0]
-    return ''
+    exported = run(['defaults', 'export', 'com.apple.dt.Xcode', '-'])
+    try:
+        teams = xcode_teams(plistlib.loads(exported.stdout.encode())) if exported.returncode == 0 else []
+    except plistlib.InvalidFileException:
+        teams = []
+    return teams[0] if teams else ''
 
 
-def devicectl_json(*args) -> dict:
+def devicectl_json(*args, timeout: Optional[float] = None) -> dict:
     with tempfile.TemporaryDirectory() as folder:
         out = Path(folder) / 'out.json'
-        result = run(['xcrun', 'devicectl', *args, '--quiet', '--json-output', out])
+        try:
+            result = run(['xcrun', 'devicectl', *args, '--quiet', '--json-output', out], timeout=timeout)
+        except subprocess.TimeoutExpired:
+            raise Failure('The Apple TV did not answer.') from None
         if not out.is_file():
             raise Failure(result.stderr.strip() or 'devicectl gave no answer. Is Xcode installed?')
         return json.loads(out.read_text())
@@ -246,6 +353,71 @@ def cmd_devices(_) -> None:
     print(json.dumps({'devices': apple_tvs(devicectl_json('list', 'devices'))}))
 
 
+def tool_path() -> str:
+    return os.pathsep.join(TOOL_PATHS + [os.environ.get('PATH', '/usr/bin:/bin:/usr/sbin:/sbin')])
+
+
+def first_line(result: subprocess.CompletedProcess) -> str:
+    return (result.stdout.strip() or result.stderr.strip()).split('\n')[0]
+
+
+def checks() -> list:
+    """What a build needs that the app cannot carry, each with what to do about it. The NSP script checks the same things (check_prereqs) once a build starts."""
+    out = []
+
+    def check(name: str, ok, detail: str, fix: str = '', command: str = '') -> bool:
+        out.append({'name': name, 'ok': bool(ok), 'detail': detail, 'fix': '' if ok else fix, 'command': '' if ok else command})
+        return bool(ok)
+
+    developer = run(['xcode-select', '-p']).stdout.strip()
+    xcode = run(['xcodebuild', '-version']) if developer and 'CommandLineTools' not in developer else None
+    if check('Xcode', xcode and xcode.returncode == 0, ' '.join(xcode.stdout.split('\n')[0:1]) if xcode else 'Not installed, or not the selected developer folder',
+             'Install Xcode from the App Store and open it once. If it is installed, select it:', 'sudo xcode-select -s /Applications/Xcode.app'):
+        for sdk, platform in (('appletvos', 'tvOS'), ('iphoneos', 'iOS')):   # the shaders are iOS Metal libraries, so a tvOS build needs the iOS platform too
+            version = run(['xcrun', '--sdk', sdk, '--show-sdk-version'])
+            check(f'{platform} platform', version.returncode == 0, f'SDK {version.stdout.strip()}' if version.returncode == 0 else 'Not installed',
+                  'Xcode > Settings > Components, or in Terminal:', f'xcodebuild -downloadPlatform {platform}')
+        metal = run(['xcrun', '-sdk', 'iphoneos', 'metal', '--version'])
+        check('Metal toolchain', metal.returncode == 0, first_line(metal) if metal.returncode == 0 else 'Not installed', 'In Terminal:', 'xcodebuild -downloadComponent MetalToolchain')
+    team = known_team()
+    check('Apple ID', team, f'Signing team {team}', 'Open Xcode, then Settings > Accounts, and add your Apple ID. A free one works: its installs open for 7 days.')
+    path = tool_path()
+    missing = [formula for tool, formula in (('xcodegen', 'xcodegen'), ('zstd', 'zstd'), ('glslangValidator', 'glslang')) if not shutil.which(tool, path=path)]
+    brew = shutil.which('brew', path=path)
+    check('Build tools', not missing, 'xcodegen, zstd and glslang' if not missing else 'Missing: ' + ', '.join(missing),
+          'In Terminal:' if brew else 'Install Homebrew from brew.sh, then in Terminal:', 'brew install ' + ' '.join(missing))
+    dotnet = shutil.which('dotnet', path=path)
+    sdks = run([dotnet, '--list-sdks']).stdout.split('\n') if dotnet else []
+    check('.NET SDK 10', any(line.startswith('10.') for line in sdks), next((line.split(' ')[0] for line in sdks if line.startswith('10.')), 'Not installed'),
+          'It builds the game extractor and runs the shader translator. In Terminal:', 'brew install --cask dotnet-sdk')
+    python = venv_ready() and str(DATA / 'venv/bin/python3') or borrowed_python()
+    check('Python', python, f'Python {PYTHON_VERSION} in TVPort\'s folder' if venv_ready() else f'Borrowing {python}' if python else 'Not set up yet',
+          'Press Set Up: TVPort downloads its own Python once.' if uv_tool() else 'TVPort makes its own Python with uv. In Terminal:', '' if uv_tool() else 'brew install uv')
+    return out
+
+
+def engine_info() -> dict:
+    info = json.loads((REPO / 'engine.json').read_text()) if (REPO / 'engine.json').is_file() else {}
+    return {'bundled': BUNDLED, 'folder': str(REPO), 'commit': info.get('commit', ''), 'chain': chain()}
+
+
+def cmd_doctor(_) -> None:
+    found = checks()
+    own = not venv_ready() and bool(uv_tool()) and (BUNDLED or not borrowed_python())   # the app makes its own, rather than lean on another's that may change
+    print(json.dumps({'checks': found, 'ready': all(c['ok'] for c in found), 'needs_setup': own,
+                      'can_set_up': bool(uv_tool()), 'engine': engine_info()}))
+
+
+def cmd_setup(_) -> None:
+    """The app's first run, and the first run of each release: unpack its engine (main) and make its Python. Holds the build lock, as a build uses both."""
+    lock = one_build_at_a_time()   # noqa: F841 held until this process exits
+    if BUNDLED:
+        prune_engines(REPO)
+    if not venv_ready():
+        set_up_python()
+    emit('done', engine=engine_info())
+
+
 def cmd_inspect(args) -> None:
     game = Game(args.folder)
     app = game.earlier_app() if game.build else None
@@ -254,7 +426,7 @@ def cmd_inspect(args) -> None:
     print(json.dumps({'folder': str(game.folder), 'title_id': game.title_id, 'name': game.name() if game.build else game.folder.name, 'version': game.version() if game.build else '',
                       'sources': game.sources, 'prepared': game.prepared, 'icon': str(game.icon) if game.icon else None, 'team': team,
                       'bundle_id': game.bundle_id(team) if game.build and team else None, 'signing': profile, 'saved': game.state(),
-                      'keys': str(find_keys(game) or '') or None, 'last_backup': latest_backup(game).name if latest_backup(game) else None}))
+                      'keys': str(find_keys(game) or '') or None, **backup_info(latest_backup(game))}))
 
 
 def cmd_preview(args) -> None:
@@ -273,52 +445,122 @@ def find_keys(game: Game) -> Optional[Path]:
     return None
 
 
+def save_listing(device: str, bundle: str) -> Optional[dict]:
+    """The committed saves on the TV, as {path under Library/Caches: [size, last change]}, from one listing: empty for a game that is not installed, None for a TV that did not answer."""
+    try:
+        data = devicectl_json('device', 'info', 'files', '--device', device, '--domain-type', 'appDataContainer', '--domain-identifier', bundle, '--subdirectory', CACHES, timeout=TV_TIMEOUT_S)
+    except (Failure, json.JSONDecodeError):
+        return None
+    if 'error' in data:
+        return {} if data['error'].get('domain') == 'CoreDevice.ActionError' else None   # ActionError: the TV answered, and has no such app or folder
+    return {f['relativePath']: [f.get('metadata', {}).get('size'), f.get('metadata', {}).get('lastModDate')] for f in data.get('result', {}).get('files', [])
+            if SAVE_FILE.match(f.get('relativePath', '')) and not f.get('resources', {}).get('isDirectory')}
+
+
 def save_files(device: str, bundle: str) -> list:
     """The committed saves on the TV, as paths under Library/Caches. An app that is not installed has none."""
-    try:
-        data = devicectl_json('device', 'info', 'files', '--device', device, '--domain-type', 'appDataContainer', '--domain-identifier', bundle, '--subdirectory', CACHES)
-    except (Failure, json.JSONDecodeError):
-        return []
-    return sorted(f['relativePath'] for f in data.get('result', {}).get('files', []) if SAVE_FILE.match(f.get('relativePath', '')) and not f.get('resources', {}).get('isDirectory'))
+    return sorted(save_listing(device, bundle) or {})
+
+
+def backup_places(game: Game) -> list:
+    """Where a game's backups are: beside the game, and in iCloud Drive when it is on (TVPort Saves/<title ID>)."""
+    places = [game.build / SAVE_BACKUPS] if game.build else []
+    if game.title_id and ICLOUD.is_dir():
+        places.append(ICLOUD / ICLOUD_SAVES / game.title_id)
+    return places
+
+
+def newest_backup(places: Iterable[Path]) -> Optional[Path]:
+    """The newest backup in any of these places: by name, which is the time it was made."""
+    found = [p for place in places if place.is_dir() for p in place.iterdir() if p.is_dir() and BACKUP_NAME.match(p.name)]
+    return max(found, key=lambda p: p.name, default=None)
 
 
 def latest_backup(game: Game) -> Optional[Path]:
-    folders = sorted(p for p in (game.build / SAVE_BACKUPS).glob('*') if p.is_dir()) if game.build else []
-    return folders[-1] if folders else None
+    return newest_backup(backup_places(game))
+
+
+def backup_time(backup: Optional[Path]) -> Optional[float]:
+    try:
+        return datetime.strptime(backup.name[:17], '%Y-%m-%d-%H%M%S').timestamp() if backup else None
+    except ValueError:
+        return None
+
+
+def read_manifest(backup: Path) -> Optional[dict]:
+    try:
+        return json.loads((backup / MANIFEST).read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
 
 
 def same_files(one: Path, other: Path) -> bool:
-    names = lambda root: sorted(str(p.relative_to(root)) for p in root.rglob('*') if p.is_file())
+    names = lambda root: sorted(str(p.relative_to(root)) for p in root.rglob('*') if p.is_file() and SAVE_FILE.match(str(p.relative_to(root))))
     return names(one) == names(other) and all((one / n).read_bytes() == (other / n).read_bytes() for n in names(one))
 
 
-def backup_saves(game: Game, device: str, bundle: str) -> dict:
-    """Copies the TV's saves to the Mac, which survives what the TV's storage may not: an app deleted on the TV takes its preferences with it. Identical saves make no new backup."""
-    files = save_files(device, bundle)
-    if not files:
-        return {'files': 0, 'folder': None, 'changed': False}
-    incoming = game.build / '.save-backup-incoming'   # outside the backups, so a copy that fails partway is never taken for one
-    shutil.rmtree(incoming, ignore_errors=True)
-    for name in files:
-        (incoming / name).parent.mkdir(parents=True, exist_ok=True)
-        run(['xcrun', 'devicectl', 'device', 'copy', 'from', '--device', device, '--domain-type', 'appDataContainer', '--domain-identifier', bundle, '--source', f'{CACHES}/{name}', '--destination', incoming / name])
-        if not (incoming / name).is_file():
+def kept_backups(names: Iterable[str], today) -> set:
+    """Of a place's backup folders, those to keep: the newest KEEP_BACKUPS, and the newest of each of the last KEEP_DAYS days (today the newest)."""
+    names = sorted(n for n in names if BACKUP_NAME.match(n))
+    newest_of_day = {name[:10]: name for name in names}   # sorted, so each day ends on its newest
+    first_day = (today - timedelta(days=KEEP_DAYS - 1)).isoformat()
+    return set(names[-KEEP_BACKUPS:]) | {name for day, name in newest_of_day.items() if day >= first_day}
+
+
+def prune_backups(place: Path) -> None:
+    folders = [p for p in place.iterdir() if p.is_dir() and BACKUP_NAME.match(p.name)]
+    keep = kept_backups([p.name for p in folders], datetime.now().date())
+    for old in folders:
+        if old.name not in keep:
+            shutil.rmtree(old)
+
+
+def backup_info(backup: Optional[Path]) -> dict:
+    return {'last_backup': backup.name if backup else None, 'last_backup_time': backup_time(backup), 'last_backup_place': None if not backup else 'icloud' if ICLOUD in backup.parents else 'mac'}
+
+
+def backup_saves(game: Game, device: str, bundle: str, icloud: bool = False, attempts: int = 3) -> dict:
+    """Copies the TV's saves to the Mac, which survives what the TV's storage may not: an app deleted on the TV takes its preferences with it. With icloud, and iCloud Drive on,
+    the copy goes to iCloud Drive instead. Only reads the TV: it lists files and copies them from it.
+    The newest backup keeps the TV's listing it came from, and the same listing again copies nothing. A copy is kept only when a second listing after it matches the first: the
+    game commits a save by swapping save.work into save, and a copy across that swap could mix old and new files. Identical saves make no new backup."""
+    lock = (game.build / '.save-backup.lock').open('w')   # the app's rounds and a build's backup can meet
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    newest, listing = latest_backup(game), None
+    for _ in range(attempts):
+        listing = save_listing(device, bundle)
+        if not listing:
+            return {'files': 0, 'folder': None, 'changed': False, 'state': 'unavailable' if listing is None else 'none'}
+        if newest and read_manifest(newest) == listing:
+            return {'files': len(listing), 'folder': str(newest), 'changed': False, 'state': 'unchanged'}
+        incoming = Path(tempfile.mkdtemp(prefix='.save-backup-incoming-', dir=game.build))   # outside the backups, so a copy that fails partway is never taken for one
+        try:
+            for name in listing:
+                (incoming / name).parent.mkdir(parents=True, exist_ok=True)
+                run(['xcrun', 'devicectl', 'device', 'copy', 'from', '--device', device, '--domain-type', 'appDataContainer', '--domain-identifier', bundle, '--source', f'{CACHES}/{name}', '--destination', incoming / name])
+                if not (incoming / name).is_file():
+                    raise Failure(f'Could not copy {name} from the Apple TV. Nothing was changed.')
+            if save_listing(device, bundle) != listing:
+                continue   # the game saved during the copy
+            if newest and same_files(incoming, newest):
+                (newest / MANIFEST).write_text(json.dumps(listing))   # the same saves, written again: the next round needs no copy
+                return {'files': len(listing), 'folder': str(newest), 'changed': False, 'state': 'unchanged'}
+            (incoming / MANIFEST).write_text(json.dumps(listing))
+            place = backup_places(game)[-1] if icloud else game.build / SAVE_BACKUPS
+            stamp, n = datetime.now().strftime('%Y-%m-%d-%H%M%S'), 1
+            target = place / stamp
+            while target.exists() or target.parent.joinpath(f'.{target.name}.partial').exists():
+                n += 1
+                target = place / f'{stamp}-{n}'
+            partial = place / f'.{target.name}.partial'   # in the same place, so the backup appears whole
+            partial.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copytree(incoming, partial)
+            partial.rename(target)
+            prune_backups(place)
+            return {'files': len(listing), 'folder': str(target), 'changed': True, 'state': 'backed-up'}
+        finally:
             shutil.rmtree(incoming, ignore_errors=True)
-            raise Failure(f'Could not copy {name} from the Apple TV. Nothing was changed.')
-    newest = latest_backup(game)
-    if newest and same_files(incoming, newest):
-        shutil.rmtree(incoming)
-        return {'files': len(files), 'folder': str(newest), 'changed': False}
-    stamp, n = datetime.now().strftime('%Y-%m-%d-%H%M%S'), 1
-    target = game.build / SAVE_BACKUPS / stamp
-    while target.exists():
-        n += 1
-        target = game.build / SAVE_BACKUPS / f'{stamp}-{n}'
-    target.parent.mkdir(parents=True, exist_ok=True)
-    incoming.rename(target)
-    for old in sorted(p for p in target.parent.iterdir() if p.is_dir())[:-KEEP_BACKUPS]:
-        shutil.rmtree(old)
-    return {'files': len(files), 'folder': str(target), 'changed': True}
+    return {'files': len(listing or {}), 'folder': str(newest) if newest else None, 'changed': False, 'state': 'busy'}
 
 
 def restore_saves(game: Game, device: str, bundle: str) -> int:
@@ -458,7 +700,7 @@ def install(game: Game, device: str, bundle: str) -> None:
 
 def one_build_at_a_time():
     """Two builds would write the same project and race each other's install on the TV. The system drops this lock when the process ends, however it ends."""
-    path = SUPPORT / 'TVPort/build.lock'
+    path = DATA / 'build.lock'
     path.parent.mkdir(parents=True, exist_ok=True)
     lock = path.open('w')
     try:
@@ -474,15 +716,20 @@ def cmd_build(args) -> None:
     team = args.team or known_team()
     if not team:
         raise Failure('No Apple signing team found. Open Xcode, sign in under Settings > Accounts, and build any app for the Apple TV once.')
+    if BUNDLED:
+        prune_engines(REPO)
     python = engine_python()
+    os.environ['PATH'] = os.pathsep.join([str(Path(python).parent), os.environ.get('PATH', '')])   # the engine's own `python3` calls (build_ipa.sh) take this one, not the system's 3.9
     if not game.prepared:
         game = prepare_game(game, args.keys, team, python)
     bundle = game.bundle_id(team)
     if args.device:
         remember_shaders(game, args.device, bundle)
         stage('Backing up saves to this Mac')
-        backup = backup_saves(game, args.device, bundle)
-        emit('log', line=f'{backup["files"]} save files backed up.' if backup['changed'] else 'The saves on this Mac are already up to date.' if backup['files'] else 'No saves on the Apple TV yet.')
+        backup = backup_saves(game, args.device, bundle, icloud=args.icloud)
+        emit('log', line={'backed-up': f'{backup["files"]} save files backed up.', 'unchanged': 'The saves on this Mac are already up to date.', 'none': 'No saves on the Apple TV yet.',
+                          'unavailable': 'The saves on the Apple TV could not be read, so this build goes ahead without a new backup.',
+                          'busy': 'The game kept saving during each copy, so this build goes ahead without a new backup.'}[backup['state']])
     project = generate_project(game, args, team, bundle, python)
     bundle_shaders(game, project)
     compile_app(game, project, args.device)
@@ -499,7 +746,39 @@ def cmd_backup(args) -> None:
     game = Game(args.folder)
     if not game.build:
         raise Failure('This game has not been built yet, so it has no saves.')
-    print(json.dumps(backup_saves(game, args.device, args.bundle)))
+    print(json.dumps(backup_saves(game, args.device, args.bundle, icloud=args.icloud)))
+
+
+def build_running() -> bool:
+    try:
+        lock = one_build_at_a_time()
+    except Failure:
+        return True
+    lock.close()
+    return False
+
+
+def cmd_autobackup(args) -> None:
+    """One round of the app's automatic backups, for each built game in turn. It only reads the TV, as backup_saves does, and never launches, ends or installs anything.
+    A round is skipped while a build runs, as each build backs up first, and ends at the first game the TV does not answer for: it is asleep or off the network."""
+    out = {'state': 'done', 'games': {}, 'icloud': ICLOUD.is_dir()}
+    if build_running():
+        out['state'] = 'building'
+    for folder in args.folder if out['state'] == 'done' else []:
+        game = Game(Path(folder)) if Path(folder).is_dir() else None
+        app = game.earlier_app() if game and game.build else None
+        bundle = game and game.build and (game.state().get('bundle_id') or app and plistlib.loads((app / 'Info.plist').read_bytes())['CFBundleIdentifier'])
+        if not bundle:
+            continue   # never built, so never installed
+        try:
+            result = backup_saves(game, args.device, bundle, icloud=args.icloud, attempts=1)
+        except Failure as failure:
+            result = {'state': 'failed', 'message': str(failure)}
+        out['games'][folder] = {'state': result['state'], 'checked': time.time() if result['state'] in ('backed-up', 'unchanged') else None, **backup_info(latest_backup(game))}
+        if result['state'] == 'unavailable':   # asleep or off the network: each further game would wait as long
+            out['state'] = 'unreachable'
+            break
+    print(json.dumps(out))
 
 
 def running_pids(listing: dict, executable: str = 'DmIOS') -> list:
@@ -597,6 +876,7 @@ def cmd_diagnose(args) -> None:
 
 
 def main() -> int:
+    global REPO
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest='command', required=True)
     commands.add_parser('devices')
@@ -615,21 +895,35 @@ def main() -> int:
     build.add_argument('--texture-cap', type=int, choices=TEXTURE_CAPS, default=512)
     build.add_argument('--fps', action='store_true')
     build.add_argument('--players', default='')
+    build.add_argument('--icloud', action='store_true')
     backup = commands.add_parser('backup')
     backup.add_argument('folder', type=Path)
     backup.add_argument('--device', required=True)
     backup.add_argument('--bundle', required=True)
+    backup.add_argument('--icloud', action='store_true', help='new backups go to iCloud Drive (TVPort Saves) when it is on')
+    autobackup = commands.add_parser('autobackup')
+    autobackup.add_argument('--device', required=True)
+    autobackup.add_argument('--folder', action='append', default=[])
+    autobackup.add_argument('--icloud', action='store_true')
     launch = commands.add_parser('launch')
     launch.add_argument('--device', required=True)
     launch.add_argument('--bundle', required=True)
     diagnose = commands.add_parser('diagnose')
     diagnose.add_argument('--device', required=True)
     diagnose.add_argument('--bundle', required=True)
+    commands.add_parser('doctor')
+    commands.add_parser('setup')
     args = parser.parse_args()
+    streamed = args.command in ('build', 'setup')
     try:
-        {'devices': cmd_devices, 'inspect': cmd_inspect, 'preview': cmd_preview, 'build': cmd_build, 'backup': cmd_backup, 'launch': cmd_launch, 'diagnose': cmd_diagnose}[args.command](args)
+        if BUNDLED:
+            if args.command == 'setup':
+                stage('Unpacking the engine')
+            REPO = unpack_engine(HERE, DATA)
+        {'devices': cmd_devices, 'inspect': cmd_inspect, 'preview': cmd_preview, 'build': cmd_build, 'backup': cmd_backup, 'launch': cmd_launch, 'diagnose': cmd_diagnose,
+         'doctor': cmd_doctor, 'setup': cmd_setup, 'autobackup': cmd_autobackup}[args.command](args)
     except Failure as failure:
-        if args.command == 'build':
+        if streamed:
             emit('error', message=str(failure))
         else:
             print(json.dumps({'error': str(failure)}))

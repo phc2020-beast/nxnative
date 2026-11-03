@@ -23,23 +23,31 @@ struct ContentView: View {
                 VStack(alignment: .leading, spacing: 2) {
                     Text(game.name).lineLimit(1)
                     Text(game.titleID.isEmpty ? "Not built yet" : game.titleID).font(.caption).foregroundStyle(.secondary)
+                    if let time = library.backedUp(game) { Text("Saves backed up \(time)").font(.caption).foregroundStyle(.secondary) }
                 }
                 .tag(game.id)
                 .contextMenu { Button("Remove from List") { library.remove(game) } }
             }
             .navigationSplitViewColumnWidth(min: 200, ideal: 230)
             .toolbar {
+                Button { library.showingSetup = true } label: {
+                    Label("Setup", systemImage: library.setupMissing.isEmpty ? "checkmark.seal" : "exclamationmark.triangle")
+                }
+                .help("What TVPort needs on this Mac to build")
                 Button { choosingFolder = true } label: { Label("Add Game", systemImage: "plus") }
                     .help("Add a folder holding your game's .nsp or .xci files")
             }
         } detail: {
             if library.current == nil {
-                ContentUnavailableView {
-                    Label("No games yet", systemImage: "appletv")
-                } description: {
-                    Text("Add a folder holding your own game's .nsp or .xci files, with any update or DLC.")
-                } actions: {
-                    Button("Add Game Folder…") { choosingFolder = true }.buttonStyle(.borderedProminent)
+                VStack(spacing: 0) {
+                    SetupBanner().padding(20)
+                    ContentUnavailableView {
+                        Label("No games yet", systemImage: "appletv")
+                    } description: {
+                        Text("Add a folder holding your own game's .nsp or .xci files, with any update or DLC.")
+                    } actions: {
+                        Button("Add Game Folder…") { choosingFolder = true }.buttonStyle(.borderedProminent)
+                    }
                 }
             } else {
                 GameView()
@@ -48,6 +56,9 @@ struct ContentView: View {
         .fileImporter(isPresented: $choosingFolder, allowedContentTypes: [.folder]) { result in
             if case .success(let folder) = result { library.add(folder: folder) }
         }
+        .sheet(isPresented: $library.showingSetup) { SetupView().environmentObject(library) }
+        .task { await library.checkSetup() }
+        .task { await library.backUpEveryFewMinutes() }
         .task(id: library.selection) { await library.refresh() }
     }
 }
@@ -60,7 +71,11 @@ struct GameView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 20) {
                     Header()
+                    SetupBanner()
                     if let notice = library.notice { NoticeBar(text: notice) }
+                    if let info = library.info, !info.prepared, info.sources.isEmpty {
+                        NoticeBar(text: "This folder has no .nsp, .xci, .nsz or .xcz files. TVPort builds only from games you dumped from your own Switch.")
+                    }
                     HStack(alignment: .top, spacing: 20) {
                         ArtworkCard().frame(width: 300)
                         SettingsForm()
@@ -91,7 +106,7 @@ struct GameView: View {
     }
 
     private var canBuild: Bool {
-        guard let info = library.info, library.device != nil else { return false }
+        guard let info = library.info, library.device != nil, library.setupMissing.isEmpty, !library.settingUp else { return false }
         return info.prepared || (!info.sources.isEmpty && library.keys != nil)
     }
 }
@@ -113,6 +128,85 @@ struct Header: View {
         } else {
             ProgressView().controlSize(.small)
         }
+    }
+}
+
+/// Shown while something a build needs is missing, or while the first start sets up the engine.
+struct SetupBanner: View {
+    @EnvironmentObject var library: Library
+
+    var body: some View {
+        if library.settingUp {
+            HStack {
+                ProgressView().controlSize(.small)
+                Text("Setting up: \(library.setupStage)").lineLimit(1)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading).padding(10).background(.blue.opacity(0.1), in: RoundedRectangle(cornerRadius: 8))
+        } else if !library.setupMissing.isEmpty || library.setupFailure != nil {
+            HStack {
+                Label(library.setupFailure != nil ? "TVPort could not finish setting up." : "Before the first build, this Mac needs: \(library.setupMissing.map(\.name).joined(separator: ", ")).",
+                      systemImage: "exclamationmark.triangle")
+                Spacer()
+                Button("Show Setup") { library.showingSetup = true }
+            }
+            .padding(10).background(.orange.opacity(0.15), in: RoundedRectangle(cornerRadius: 8))
+        }
+    }
+}
+
+struct SetupView: View {
+    @EnvironmentObject var library: Library
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("Setup").font(.title2.weight(.semibold))
+            Text("TVPort carries its engine and sets up its own Python. A build also needs these from Apple and others, which only you can install. Your games and prod.keys stay in the folders you choose.")
+                .foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            if let checks = library.setup?.checks {
+                ForEach(checks) { check in
+                    HStack(alignment: .top, spacing: 10) {
+                        Image(systemName: check.ok ? "checkmark.circle.fill" : "exclamationmark.circle.fill").foregroundStyle(check.ok ? .green : .orange)
+                        VStack(alignment: .leading, spacing: 3) {
+                            HStack {
+                                Text(check.name).font(.headline)
+                                Text(check.detail).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
+                            }
+                            if !check.ok {
+                                if !check.fix.isEmpty { Text(check.fix).fixedSize(horizontal: false, vertical: true) }
+                                if !check.command.isEmpty {
+                                    HStack {
+                                        Text(check.command).font(.system(.callout, design: .monospaced)).textSelection(.enabled)
+                                        Button("Copy") {
+                                            NSPasteboard.general.clearContents()
+                                            NSPasteboard.general.setString(check.command, forType: .string)
+                                        }
+                                        .controlSize(.small)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                ProgressView().controlSize(.small)
+            }
+            if library.settingUp {
+                HStack { ProgressView().controlSize(.small); Text(library.setupStage) }
+            }
+            if let failure = library.setupFailure {
+                Text(failure).font(.callout).foregroundStyle(.red).textSelection(.enabled).lineLimit(8)
+            }
+            HStack {
+                Button("Check Again") { Task { await library.checkSetup() } }.disabled(library.settingUp)
+                if library.setup?.can_set_up == true && library.setup?.checks.first(where: { $0.name == "Python" })?.ok == false {
+                    Button("Set Up") { library.runSetup() }.disabled(library.isBusy)
+                }
+                Spacer()
+                Button("Done") { dismiss() }.keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(20).frame(width: 600)
     }
 }
 
@@ -189,7 +283,16 @@ struct SettingsForm: View {
                 TextField("Players", text: playersBinding, prompt: Text("Names, separated by commas"))
                 Text("With two or more names, the Apple TV asks who's playing, and each person gets their own saves. The first name picked keeps the saves already on the TV. Takes effect at the next Build & Install.")
                     .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-                if let last = library.info?.last_backup { LabeledContent("Last backup on this Mac", value: last) }
+                Toggle("Keep backups in iCloud Drive", isOn: $library.icloudBackups)
+                Text("While TVPort is open, it backs up each built game's saves from the Apple TV every 5 minutes, only reading the TV. With this on, new backups go to iCloud Drive, in TVPort Saves.")
+                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                if library.icloudBackups && !library.icloudAvailable {
+                    Label("iCloud Drive is off on this Mac, so backups stay beside the game. Turn it on in System Settings > Apple Account > iCloud.", systemImage: "icloud.slash")
+                        .font(.caption).foregroundStyle(.orange).fixedSize(horizontal: false, vertical: true)
+                }
+                if let game = library.current, let time = library.backedUp(game) {
+                    LabeledContent("Last backup", value: "\(time), \(place(game))")
+                }
             }
             if library.info?.prepared == false {
                 Section("First Build") {
@@ -199,6 +302,8 @@ struct SettingsForm: View {
                             Button("Choose…") { choosingKeys = true }
                         }
                     }
+                    Text("The keys of your own Switch. The first build reads them to decrypt the game, and TVPort never copies them or puts them in what it builds.")
+                        .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                 }
             }
         }
@@ -206,6 +311,10 @@ struct SettingsForm: View {
         .fileImporter(isPresented: $choosingKeys, allowedContentTypes: [.data, .item]) { result in
             if case .success(let url) = result { library.update { $0.keys = url.path } }
         }
+    }
+
+    private func place(_ game: Game) -> String {
+        (library.backups[game.folder]?.last_backup_place ?? library.info?.last_backup_place) == "icloud" ? "iCloud Drive" : "this Mac"
     }
 
     private var playersBinding: Binding<String> {
