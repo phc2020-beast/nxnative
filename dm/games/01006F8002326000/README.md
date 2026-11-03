@@ -33,6 +33,7 @@ On the Mac: a new game through Tom Nook's counter (name entry on the game's own 
 
 ## Saves
 
+- **Open: several players, one island (Apple TV).** Each name in TVPort's Players is a user of this console and a resident of the same island: [Players sharing a console's save](../../../docs/reference/services.md#players-sharing-a-consoles-save). Not run yet.
 - A save is not reached on the Mac: the game first saves when the player sleeps at the end of the first day (the `−` menu says "You can't save right now." before that). Until then it only probes for `main.dat`, `mainHeader.dat` and `Moved/personal.dat` in its device save data.
 
 ## Movies

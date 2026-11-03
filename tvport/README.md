@@ -85,11 +85,11 @@ tvOS has no lasting storage for files: on tvOS 27.2, `Documents` refuses writes 
 
 The protected copy comes back by itself when the save folder is empty. Build & Install backs up to the Mac first, and puts the newest backup on a TV that has lost its saves. It never replaces a save that is there. **Back Up Saves** does the same copy to the Mac at any time.
 
-The preferences abort the app past about 1 MB, so TVSaves.m keeps them under 900 KB, and a save that would pass that goes to a plain file in `Library/Preferences`. That folder took a write in testing, but Apple does not promise to keep it. `NSUserDefaults` is the documented one.
+The preferences abort the app past about 1 MB, so TVSaves.m keeps them under 900 KB, and a save that would pass that goes to a plain file in `Library/Preferences`. That folder took a write in testing, but Apple does not promise to keep it. `NSUserDefaults` is the documented one. Animal Crossing's island always goes there: it is 24 MB of encrypted files that do not compress. Saves are stored with LZFSE, which takes a fraction of a second, and the copy starts as soon as the app stops being active, so closing it from the app switcher right after a save no longer loses the copy.
 
 ### Players
 
-Apple's way to give each Apple TV profile its own data is the User Management capability, which a free Apple ID cannot have: Xcode refuses it, so the app cannot see which profile is active. With two or more names in **Players**, the game asks "Who's playing?" before it starts, and each name gets its own saves (`dm/ios/SourcesTV/TVPlayers.m`). The first name ever picked keeps the save already on the TV, and a name keeps its saves for good, so renaming someone starts them fresh.
+Apple's way to give each Apple TV profile its own data is the User Management capability, which a free Apple ID cannot have: Xcode refuses it, so the app cannot see which profile is active. With two or more names in **Players**, the game asks "Who's playing?" before it starts, and each name gets its own saves (`dm/ios/SourcesTV/TVPlayers.m`). The first name listed keeps the save already on the TV, whoever picks first, and a name keeps its saves for good, so renaming someone starts them fresh. A game whose only save belongs to the console keeps one save for everyone instead, as on a Switch: in Animal Crossing each name is a resident of the same island, and the first name listed keeps the first user. Up to 8 names.
 
 ## Limits
 

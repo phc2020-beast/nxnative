@@ -113,8 +113,10 @@ static void host_preload(int argc, char **argv) {
     { void loader_hash_log(void); loader_hash_log(); }   // DM_LOADHASH=1: address-independent hash of the load result (loader.c)
     { void dm_ue_malloc_install(void); dm_ue_malloc_install(); }   // Unreal's allocator on a host malloc zone, for the builds whose constructor call is cut (hle_uemalloc.c)
 }
-static struct { int argc; char **argv; pthread_t th; _Atomic int started; } g_pre;
-static void *preload_thread(void *a) { (void)a; host_preload(g_pre.argc, g_pre.argv); return NULL; }
+static struct { int argc; char **argv; pthread_t th; _Atomic int started, done; } g_pre;
+static void *preload_thread(void *a) { (void)a; host_preload(g_pre.argc, g_pre.argv); atomic_store(&g_pre.done, 1); return NULL; }
+// For a front end that needs what loading found (dm_console_save_only) before the game starts
+void dm_host_preload_wait(void) { if (atomic_load(&g_pre.started)) while (!atomic_load(&g_pre.done)) usleep(1000); }
 static void *keyrace_thread(void *unused) {
     (void)unused;
     for (unsigned i = 0; i < g_race_want; i++) if (pthread_key_create(&g_race_keys[g_race_n++], NULL)) break;

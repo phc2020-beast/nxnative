@@ -125,6 +125,9 @@ int dm_main_imports(const char *prefix) {
     return 0;
 }
 
+// A game whose only save is the device save: one save for the console, whoever plays (Animal Crossing: New Horizons, its island)
+int dm_console_save_only(void) { return dm_main_imports("_ZN2nn2fs19MountDeviceSaveData") && !dm_main_imports("_ZN2nn2fs13MountSaveData"); }
+
 // SDK major version, from the version string the SDK's libraries keep in the sdk module's read-only data ("NintendoSDK_nnSdk-10_4_0"; SDK 12 spells it NintendoSdk_;
 // Switch 2 SDKs name a variant first: "NintendoSdk_nnSdk-Generic_20_5_19", Donkey Kong Bananza).
 // Behaviour that follows the SDK version is decided by it (the NVN API version, the shared-font layout), not by the game profile. 0 = no sdk module or no version string
