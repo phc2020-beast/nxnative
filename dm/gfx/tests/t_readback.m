@@ -263,6 +263,7 @@ static void mirror_completion(void) {
 
 int main(void) { @autoreleasepool {
     alarm(60); if (setvbuf(stdout, NULL, _IONBF, 0)) abort();   // GPU, callback and pthread failures must not leave the check target hanging.
+    setenv("DM_NVN_ALLOCPROF", "1", 1);   // keeps the objects taken out of the residency set in a weak table (g_retired): the readback buffers' lifetime check below
     mtl_init();
     void *mem = NULL; if (posix_memalign(&mem, getpagesize(), 524288)) abort(); memset(mem, 0, 524288);
     // Registered with the dirty tracker as nvnMemoryPoolInitialize does: a packaged texture in an untracked pool is re-uploaded from its storage at every use, which would discard what the GPU wrote into it
@@ -318,6 +319,13 @@ int main(void) { @autoreleasepool {
     state_reset(); memset(&R, 0, sizeof R); mtl_sub_begin(); mtl_exec((const uint8_t *)h); mtl_sub_commit();
     int wait = h_nvnSyncWait(&sync, 5000000000ull); EXPECT("recorded fence wait", 1, wait == 0 || wait == 1);
     EXPECT("GPU success", 0, mtl_last_commit_error());
+    // The wait usually runs the submission's completion on this thread (post_early), and with it the landing of the readbacks (mirror_rb_land). This thread's pool stays open, as a
+    // game thread's never drains: once the deferred release has run, no readback buffer may still be alive (Tears of the Kingdom kept 1 GB of them in 100 s)
+    unsigned alive = 0;
+    for (int tries = 0; tries < 100; tries++) { defer_drain(); res_commit(); alive = 0;   // the residency set lets go of what it removed at its next commit (each submission's, in a game)
+        @autoreleasepool { pthread_mutex_lock(&g_res_mu); for (id a in g_retired.allObjects) alive += [a conformsToProtocol:@protocol(MTLBuffer)]; pthread_mutex_unlock(&g_res_mu); }
+        if (!alive) break; usleep(10000); }
+    EXPECT("readback buffers released while the waiting thread's pool stays open", 0, (int)alive);
     int bad = 0;
     for (int y=0; y<4; y++) { for (int x=0; x<8; x++) bad += memcmp(out+y*64+x*4, expected, 4) != 0;
         for (int x=32; x<64; x++) bad += out[y*64+x] != 0xEE; }

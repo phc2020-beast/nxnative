@@ -277,6 +277,18 @@ struct SettingsForm: View {
                 Text(library.current?.mode.note ?? "").font(.caption).foregroundStyle(.secondary)
                 Picker("Texture detail", selection: binding(\.texture)) { ForEach(TextureDetail.allCases) { Text($0.label).tag($0) } }
                 Text("The A15 has to store these textures uncompressed, so lower detail saves memory and shortens loading.").font(.caption).foregroundStyle(.secondary)
+                if library.info?.render_scale == true {
+                    Picker("3D resolution", selection: renderScaleBinding) {
+                        ForEach([1.0, 0.9, 0.8, 0.75, 0.7, 0.6, 0.5], id: \.self) { Text($0 == 1 ? "Full" : "\(Int(($0 * 100).rounded()))%").tag($0) }
+                    }
+                    Text("Draws the game's 3D scene at a lower resolution, so the GPU keeps up; menus and text stay sharp. Below Full the size is fixed, in place of the game's own dynamic resolution. Takes effect at the next Build & Install.")
+                        .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                }
+                if library.info?.frame_step == true {
+                    Toggle("Hold 30 fps when the Apple TV is hot", isOn: coolBinding)
+                    Text("When tvOS reports the TV as hot, it lowers the chip's speed, the GPU to about a third, whatever the game does, and this makes the game hold 30 fps so the TV cools down sooner. Off, the game keeps trying for 60, which it can then rarely reach, and the TV stays hot and slow for longer. Takes effect at the next Build & Install.")
+                        .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                }
                 Toggle("Frame-rate counter", isOn: binding(\.showFPS))
             }
             Section("Saves") {
@@ -319,6 +331,14 @@ struct SettingsForm: View {
 
     private var playersBinding: Binding<String> {
         Binding(get: { library.current?.players ?? "" }, set: { value in library.update { $0.players = value } })
+    }
+
+    private var coolBinding: Binding<Bool> {
+        Binding(get: { library.current?.coolWhenHot ?? true }, set: { value in library.update { $0.coolWhenHot = value ? nil : false } })
+    }
+
+    private var renderScaleBinding: Binding<Double> {
+        Binding(get: { library.current?.renderScale ?? 1 }, set: { value in library.update { $0.renderScale = value < 1 ? value : nil } })
     }
 
     private func binding<T>(_ path: WritableKeyPath<Game, T>) -> Binding<T> {

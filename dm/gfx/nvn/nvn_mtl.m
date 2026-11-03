@@ -133,6 +133,8 @@ static pthread_cond_t g_cv = PTHREAD_COND_INITIALIZER;
 static _Atomic uint64_t g_done;                 // GPU complete and all CPU-visible effects through this fence published
 static uint64_t g_arena_made;
 static int g_allocprof = -1; static uint64_t g_ap_bytes[64], g_ap_fn[8];
+static _Atomic uint64_t g_mrb_live, g_mrb_live_bytes;   // DM_NVN_ALLOCPROF: readback buffers queued and not landed yet (mirror_readback / mirror_rb_land)
+static inline int allocprof_on(void) { if (g_allocprof < 0) g_allocprof = getenv("DM_NVN_ALLOCPROF") != NULL; return g_allocprof > 0; }
 // Diagnostic only: inclusive wall/CPU time on the replay thread. No GPU waits
 // are added, and no clocks are read when DM_NVN_CPUPROF is absent or zero.
 typedef struct { uint64_t wall, cpu; } cp_stamp;
@@ -209,6 +211,7 @@ static void ws_report(uint64_t frame, uint64_t frames) {
 }
 #include "nvn_rec.h"   // deferred encoding (DM_NVN_ENC_THREAD)
 static NSHashTable *g_res_objects;
+static NSMapTable *g_res_line; static NSHashTable *g_retired;   // DM_NVN_ALLOCPROF: each resident object's res_add line; objects taken out of the set (weak: only the live ones stay)
 static _Atomic unsigned g_image_heap_n;
 static inline MTL4VisibilityOptions resource_vis(void) { return MTL4VisibilityOptionDevice | (g_image_heap_n ? MTL4VisibilityOptionResourceAlias : 0); }
 // Residency churn by call site (the power line every 300 frames, mtl_res_stats): each commit with changes is a kernel call whose cost grows with what was added or removed
@@ -226,6 +229,7 @@ static void res_add_at(id<MTLAllocation> allocation, int line) { @autoreleasepoo
     { int k = 0; while (k < RS_SITES - 1 && g_rs_site[k].line && g_rs_site[k].line != line) k++; g_rs_site[k].line = line; g_rs_site[k].n++; g_rs_site[k].bytes += r.allocatedSize; }
     [g_res addAllocation:(id<MTLAllocation>)r];
     [g_res_objects addObject:r];
+    if (allocprof_on()) { if (!g_res_line) g_res_line = [NSMapTable weakToStrongObjectsMapTable]; [g_res_line setObject:@(line) forKey:r]; }   // where it became resident, for the retired-but-alive report (mtl_mem_stat)
     g_res_dirty = 1;
     pthread_mutex_unlock(&g_res_mu);
 } }
@@ -236,6 +240,7 @@ static void res_remove(id<MTLAllocation> r) { @autoreleasepool {
     if (![g_res_objects containsObject:r]) { pthread_mutex_unlock(&g_res_mu); return; }
     [g_res removeAllocation:(id<MTLAllocation>)r];
     [g_res_objects removeObject:r];
+    if (allocprof_on()) { if (!g_retired) g_retired = [NSHashTable weakObjectsHashTable]; [g_retired addObject:r]; }   // still listed while something keeps it alive
     g_res_dirty = 1; g_rs_rm++;
     pthread_mutex_unlock(&g_res_mu);
 } }
@@ -343,12 +348,13 @@ static want_list g_bf_want = {"DM_NVN_BF_WANT", PTHREAD_MUTEX_INITIALIZER}, g_du
 void bf_want_note(const char *key) { want_note(&g_bf_want, key); }
 
 // ---------- Memory pools ----------
-typedef struct { uintptr_t lo, hi; uintptr_t base; __unsafe_unretained id<MTLBuffer> buf; uint64_t gpu; const void *key; int res; uint64_t born; } pool_ent;   // res: already in the residency set (on demand, see pool_res); born: when it was added (ns)
+typedef struct { uintptr_t lo, hi; uintptr_t base; __unsafe_unretained id<MTLBuffer> buf; uint64_t gpu; const void *key; int res; uint64_t born; _Atomic uint64_t *used; int pin, aged; } pool_ent;   // res: already in the residency set (on demand, see pool_res); used, pin, aged: pool_age
 static pool_ent *g_pools; static int g_npool, g_cap;
 static int g_pidx_ok, g_plast = -1;   // whether the address→pool index is valid, the last hit (pool_find)
 static NSMutableArray *g_keep;                  // Holds the buffer references (pool_ent has non-owning pointers)
 static uint64_t g_pool_adds;
 static int g_pool_res_n;   // registered pools already in the residency set (for the memory readout; under g_mu)
+static uint64_t g_pool_aged_n, g_pool_aged_b, g_pool_rewired_n, g_pool_rewired_b;   // pool_age: pools taken out of the residency set, and those the GPU addressed again after it (under g_mu)
 
 #define C1_BANK_SIZE (4u << 20)
 #define C1_DECL_SIZE (64u << 10)
@@ -498,7 +504,7 @@ static NSHashTable *g_dead_pools;
 // took the lock), and its uniform rings move to a new page every few draws (the table alone missed as often)
 enum { PC_BITS = 10, PC_RECENT = 8 };
 static _Atomic uint64_t g_pool_gen = 1;
-typedef struct { uintptr_t lo, hi, base; __unsafe_unretained id<MTLBuffer> buf; uint64_t gpu; } pc_ent;
+typedef struct { uintptr_t lo, hi, base; __unsafe_unretained id<MTLBuffer> buf; uint64_t gpu; _Atomic uint64_t *used; } pc_ent;
 static __thread struct { uint64_t gen; unsigned next; pc_ent r[PC_RECENT], e[1u << PC_BITS]; } t_pc;   // an empty entry has hi 0
 static inline unsigned pc_slot(uint64_t addr) { return (unsigned)(((addr >> 12) * 0x9E3779B97F4A7C15ull) >> (64 - PC_BITS)); }
 static inline const pc_ent *pc_get(uint64_t addr, uint64_t len) {
@@ -511,7 +517,7 @@ static inline const pc_ent *pc_get(uint64_t addr, uint64_t len) {
 static void pc_put(int i, uint64_t addr) {   // caller holds g_mu, pool i is resident and holds addr
     uint64_t gen = atomic_load_explicit(&g_pool_gen, memory_order_relaxed);
     if (t_pc.gen != gen) { memset(t_pc.r, 0, sizeof t_pc.r); memset(t_pc.e, 0, sizeof t_pc.e); t_pc.gen = gen; }
-    pc_ent c = {g_pools[i].lo, g_pools[i].hi, g_pools[i].base, g_pools[i].buf, g_pools[i].gpu};
+    pc_ent c = {g_pools[i].lo, g_pools[i].hi, g_pools[i].base, g_pools[i].buf, g_pools[i].gpu, g_pools[i].used};
     t_pc.e[pc_slot(addr)] = c; t_pc.r[t_pc.next++ % PC_RECENT] = c;
 }
 static _Atomic uint64_t g_reg_gen = 1;   // Change generation of memory pool / texture / sampler registration: one of the invalidation conditions for argument buffer reuse
@@ -522,6 +528,14 @@ static _Atomic uint64_t g_reg_gen = 1;   // Change generation of memory pool / t
 static void pool_res(int i) {
     if (g_pools[i].res) return;
     res_add(g_pools[i].buf); res_commit(); g_pools[i].res = 1; g_pool_res_n++;
+    if (g_pools[i].aged) { g_pools[i].aged = 0; g_pool_rewired_n++; g_pool_rewired_b += g_pools[i].hi - g_pools[i].lo; }
+}
+// The fence of the submission being encoded, stamped on a pool at each lookup (pool_age): stores into memory that is never freed, since a thread's address cache can outlive the pool
+static inline void pool_used(_Atomic uint64_t *used) { atomic_store_explicit(used, atomic_load_explicit(&g_fence, memory_order_relaxed) + 1, memory_order_relaxed); }
+static _Atomic uint64_t *pool_stamp_new(void) {   // caller holds g_mu
+    static _Atomic uint64_t *slab; static unsigned left;
+    if (!left) { if (!(slab = calloc(4096, sizeof *slab))) MDIE("pool stamps: out of memory"); left = 4096; }
+    left--; return slab++;
 }
 void mtl_pool_add(const void *mem, uint64_t size) {
     mtl_init(); g_reg_gen++;
@@ -547,7 +561,7 @@ void mtl_pool_add(const void *mem, uint64_t size) {
     pthread_mutex_lock(&g_mu);
     if (g_npool == g_cap) { g_cap = g_cap ? g_cap * 2 : 64; g_pools = realloc(g_pools, g_cap * sizeof *g_pools); }
     g_pidx_ok = 0; g_plast = -1; atomic_fetch_add(&g_pool_gen, 1);   // the address index and the per-thread caches are invalid (pool_find, pc_get)
-    g_pools[g_npool++] = (pool_ent){lo, hi, a, buf, buf.gpuAddress, mem, 0, clock_gettime_nsec_np(CLOCK_MONOTONIC)};   // not in the residency set yet: put in the first time it is addressed (pool_res)
+    g_pools[g_npool++] = (pool_ent){lo, hi, a, buf, buf.gpuAddress, mem, 0, clock_gettime_nsec_np(CLOCK_MONOTONIC), pool_stamp_new(), 0, 0};   // not in the residency set yet: put in the first time it is addressed (pool_res)
     g_pool_adds++;
     [g_keep addObject:buf];
     pthread_mutex_unlock(&g_mu);
@@ -590,23 +604,61 @@ static int pool_find(uint64_t addr, uint64_t len) {
 }
 int mtl_addr(uint64_t addr, uint64_t len, void **buf, uint64_t *off) {
     const pc_ent *c = pc_get(addr, len);
-    if (c) { *buf = (__bridge void *)c->buf; *off = addr - c->base; return 1; }
+    if (c) { pool_used(c->used); *buf = (__bridge void *)c->buf; *off = addr - c->base; return 1; }
     int ok = 0;
     pthread_mutex_lock(&g_mu);
     int i = pool_find(addr, len);
-    if (i >= 0) { pool_res(i); pc_put(i, addr); *buf = (__bridge void *)g_pools[i].buf; *off = addr - g_pools[i].base; ok = 1; }
+    if (i >= 0) { pool_res(i); pool_used(g_pools[i].used); pc_put(i, addr); *buf = (__bridge void *)g_pools[i].buf; *off = addr - g_pools[i].base; ok = 1; }
     pthread_mutex_unlock(&g_mu);
     return ok;
 }
 int mtl_gpu_addr(uint64_t addr, uint64_t len, void **buf, uint64_t *off, uint64_t *gpu) {
     const pc_ent *c = pc_get(addr, len);
-    if (c) { *buf = (__bridge void *)c->buf; *off = addr - c->base; *gpu = c->gpu + *off; return 1; }
+    if (c) { pool_used(c->used); *buf = (__bridge void *)c->buf; *off = addr - c->base; *gpu = c->gpu + *off; return 1; }
     int ok = 0;
     pthread_mutex_lock(&g_mu);
     int i = pool_find(addr, len);
-    if (i >= 0) { pool_res(i); pc_put(i, addr); *buf = (__bridge void *)g_pools[i].buf; *off = addr - g_pools[i].base; *gpu = g_pools[i].gpu + *off; ok = 1; }
+    if (i >= 0) { pool_res(i); pool_used(g_pools[i].used); pc_put(i, addr); *buf = (__bridge void *)g_pools[i].buf; *off = addr - g_pools[i].base; *gpu = g_pools[i].gpu + *off; ok = 1; }
     pthread_mutex_unlock(&g_mu);
     return ok;
+}
+
+// A pool whose texture the host made directly on its buffer (a linear or buffer texture): the GPU reads it through that texture with no lookup, so it stays resident (pool_age)
+static void pool_pin_at(const void *mem) { pthread_mutex_lock(&g_mu); int i = pool_find((uint64_t)(uintptr_t)mem, 1); if (i >= 0) g_pools[i].pin = 1; pthread_mutex_unlock(&g_mu); }
+// Memory pools the GPU has stopped addressing leave the residency set. A resident zero-copy buffer's pages are wired on iOS and tvOS (pool_res), and a pool stays addressed once: Tears of
+// the Kingdom on the Apple TV kept 677 of its 1,170 MB of pools wired, mostly texture data already uploaded into host textures, beside 1.1 GB of the system's own wired memory, so the
+// 4 GB of the TV had about 50 MB free and the rest of the game's memory went to flash and back when an area loaded (seconds-long frames). Every GPU use of a pool takes a lookup (mtl_addr,
+// mtl_gpu_addr), which stamps it, except through caches keyed on g_pool_gen (the per-thread table, vertex streams) or g_reg_gen (argument blocks) and through textures made on its
+// buffer (pinned). So a pass bumps both, which sends each pool's first use after it through a lookup, and POOL_AGE_IDLE submissions later, once all submissions before it have completed, it takes out
+// the pools no lookup stamped since: none of them is used by a submission still running or encoded later. One that is addressed again is put back at that lookup, as any pool is the first time.
+// DM_NVN_POOL_UNWIRE=0 off, 1 on (the default on iOS and tvOS, off on the Mac, whose memory is not as short)
+enum { POOL_AGE_EVERY = 300, POOL_AGE_IDLE = 150 };   // submissions between passes; and those a pool must go unaddressed after a pass's start to leave (about 5 s at 30 fps)
+static int pool_age_on(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("DM_NVN_POOL_UNWIRE"); v = e ? strcmp(e, "0") != 0 : TARGET_OS_IPHONE;
+        MLOG("memory pools the GPU stops addressing leave the residency set: %s (DM_NVN_POOL_UNWIRE)", v ? "on" : "off"); }
+    return v;
+}
+static void pool_age(void) {   // the submit thread, at a submission's start, before anything of it is encoded
+    static uint64_t start, next = POOL_AGE_EVERY; static int phase, lines;
+    if (!pool_age_on()) return;
+    uint64_t f = atomic_load(&g_fence);
+    if (!phase) { if (f < next) return; start = f; phase = 1; atomic_fetch_add(&g_reg_gen, 1); atomic_fetch_add(&g_pool_gen, 1); return; }
+    if (atomic_load(&g_done) < start || f < start + POOL_AGE_IDLE) return;
+    unsigned n = 0, left = 0; uint64_t b = 0, left_b = 0;
+    pthread_mutex_lock(&g_mu);
+    for (int i = 0; i < g_npool; i++) {
+        if (!g_pools[i].res) continue;
+        if (g_pools[i].pin || atomic_load_explicit(g_pools[i].used, memory_order_relaxed) > start) { left++; left_b += g_pools[i].hi - g_pools[i].lo; continue; }
+        res_remove(g_pools[i].buf); g_pools[i].res = 0; g_pools[i].aged = 1; g_pool_res_n--; n++; b += g_pools[i].hi - g_pools[i].lo;
+    }
+    if (n) { atomic_fetch_add(&g_pool_gen, 1); g_pool_aged_n += n; g_pool_aged_b += b; }   // the per-thread tables hold only resident pools
+    uint64_t rw_n = g_pool_rewired_n, rw_b = g_pool_rewired_b;
+    pthread_mutex_unlock(&g_mu);
+    if (n && (lines < 40 || !(lines % 20))) MLOG("memory pools: %u not addressed in the last %llu submissions left the residency set, %llu MB; %u stay, %llu MB; addressed again after leaving so far %llu, %llu MB",
+                     n, (unsigned long long)(f - start), (unsigned long long)(b >> 20), left, (unsigned long long)(left_b >> 20), (unsigned long long)rw_n, (unsigned long long)(rw_b >> 20));
+    if (n) lines++;
+    phase = 0; next = f + POOL_AGE_EVERY;
 }
 
 // ---------- Submission ----------
@@ -807,7 +859,7 @@ void mtl_prepare(void) {
     if (!g_warm_started && prepare_on()) { mtl_init(); shmap_load(); }
 }
 void mtl_sub_begin(void) {
-    mtl_init(); g_sub_serial++; g_seg = 0; seg_clk_put(g_sclk); g_sclk = NULL; g_rc_npend = 0; g_rc_skip = 0;
+    mtl_init(); g_sub_serial++; spin_sub_begin(); pool_age(); g_seg = 0; seg_clk_put(g_sclk); g_sclk = NULL; g_rc_npend = 0; g_rc_skip = 0;
     defer_drain();
     defer_reset();
     mtl_prepare();   // done by then in the submit entry; the replay tool (nvn_replay) reaches it here
@@ -1570,7 +1622,10 @@ static void post_run(post_rec *r, uint64_t c0, uint64_t c1) {
 }
 // Both GPU feedback and an early waiter complete records in submission order.
 // Delayed callbacks carry their fence, never the identity of a recyclable slot.
-static void post_complete(uint64_t fence, uint64_t c0, uint64_t c1) {
+// Its own autorelease pool: the early waiter is the game's thread in its SyncWait (post_early), whose implicit pool never drains, and the records' work autoreleases what it touches.
+// Without it, every render-pass readback buffer a game thread landed (mirror_rb_land) stayed alive for good: Tears of the Kingdom on the Apple TV kept 2,480 of them, 1,005 MB, within
+// 100 s, out of the residency set and still allocated, until tvOS ended it at its memory limit
+static void post_complete(uint64_t fence, uint64_t c0, uint64_t c1) { @autoreleasepool {
     uint64_t now = guest_ns();
     for (uint64_t f = g_done + 1; f <= fence; f++) {
         post_rec *r = &g_postr[f % POST_RING];
@@ -1583,7 +1638,7 @@ static void post_complete(uint64_t fence, uint64_t c0, uint64_t c1) {
         post_run(r, f == fence && c1 ? c0 : seg_ts() ? start : 0, f == fence && c1 ? c1 : seg_ts() ? now : 0);
     }
     pthread_mutex_lock(&g_mu); if (fence > g_done) g_done = fence; pthread_cond_broadcast(&g_cv); pthread_mutex_unlock(&g_mu);
-}
+} }
 uint64_t mtl_sub_commit(void) {
     lc_land();   // clears still waiting (the command list ends with them)
     defer_fallback();   // Deferred merged pass: at the end of the submission there are still P draws not replayed (the normal path never gets here)
@@ -2657,6 +2712,7 @@ static id<MTLTexture> tex_linear(const tex_t *t) {
     MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:(MTLPixelFormat)pf width:t->d.width ? t->d.width : 1 height:t->d.height ? t->d.height : 1 mipmapped:NO];
     d.resourceOptions = b.resourceOptions;
     d.usage = MTLTextureUsageShaderRead | img_usage(t, (MTLPixelFormat)pf) | (t->d.flags & NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET ? MTLTextureUsageRenderTarget : 0);
+    pool_pin_at(t->mem);
     return [b newTextureWithDescriptor:d offset:mo bytesPerRow:row];
 }
 // CPU-written block-linear textures (WriteTexels): the game gave no packaged layout and changes the content from the CPU each frame (Engage's movie frames: a Y plane R8 + a UV plane RG8, WriteTexels every frame).
@@ -2881,6 +2937,7 @@ static id<MTLTexture> tex_mtl_(const tex_t *ct) {
         size_t row = ((size_t)t->d.width * bpb + al - 1) / al * al;
         id<MTLTexture> mt = [b newTextureWithDescriptor:d offset:mo bytesPerRow:row];
         if (!mt) { RED_ONCE(39, "cannot create buffer texture: %u elements format %#x", t->d.width, t->d.format); return nil; }
+        pool_pin_at(t->mem);
         res_add(mt);
         tex_put(t->serial, mt);
         return mt;
@@ -2931,13 +2988,15 @@ void mtl_mem_stat(unsigned long long frame, unsigned long long rss_mb) {
     pthread_mutex_unlock(&g_smu);
     unsigned long dead_n = 0; unsigned long long dead_mb = 0;
     // Objects read from a weak table come back retained + autoreleased: the frame hook runs on a guest thread with no autorelease pool that drains, so without this wrapper every buffer counted would be pinned for good (the readout creating the leak itself)
-    int pres = 0; @autoreleasepool { pthread_mutex_lock(&g_mu); pres = g_pool_res_n; for (id<MTLBuffer> b in g_dead_pools) { dead_n++; dead_mb += b.length; } pthread_mutex_unlock(&g_mu); } dead_mb >>= 20;   // host objects held by serial (textures / packaged textures / programs): if it climbs along with GPU allocated, textures are not being released
+    int pres = 0; uint64_t pool_b = 0, pres_b = 0; @autoreleasepool { pthread_mutex_lock(&g_mu); pres = g_pool_res_n;
+      for (int i = 0; i < g_npool; i++) { uint64_t n = g_pools[i].hi - g_pools[i].lo; pool_b += n; if (g_pools[i].res) pres_b += n; }   // a resident pool's pages are wired on iOS and tvOS (pool_res)
+      for (id<MTLBuffer> b in g_dead_pools) { dead_n++; dead_mb += b.length; } pthread_mutex_unlock(&g_mu); } dead_mb >>= 20;   // host objects held by serial (textures / packaged textures / programs): if it climbs along with GPU allocated, textures are not being released
     // os_proc_available_memory: how far this process is from being terminated by the system for memory, iOS only; the Mac writes "none". On a phone, a crash with no log is most likely this number reaching 0
     char avail[32] = "none";
 #if TARGET_OS_IPHONE
     snprintf(avail, sizeof avail, "%llu MB", (unsigned long long)(os_proc_available_memory() >> 20));
 #endif
-    MLOG("memory up to frame %llu: resident %llu MB, GPU allocated %llu MB, deferred-release queue %lu, residency set %lu, serial objects %u, memory pools %d (resident %d; peak %d / tracking table capacity %d; freed but alive %lu, %llu MB), shared textures %u (%u of them unreferenced; evicted with pools %llu, on storage takeover %llu in total), texture re-uploads %llu in total, per-frame arena blocks created %llu in total, finalized textures still referenced %u (small table, %llu put in total); headroom to the system memory limit %s", frame, rss_mb, gpu, nd, nr, ns, live, pres, peak, cap, dead_n, dead_mb, ashared, aorph, (unsigned long long)g_alias_evicted, (unsigned long long)g_alias_taken, (unsigned long long)g_pkg_reuploads, (unsigned long long)g_arena_made, nghost, (unsigned long long)ghost_puts, avail);
+    MLOG("memory up to frame %llu: resident %llu MB, GPU allocated %llu MB, deferred-release queue %lu, residency set %lu, serial objects %u, memory pools %d (resident %d, %llu of %llu MB; peak %d / tracking table capacity %d; freed but alive %lu, %llu MB), shared textures %u (%u of them unreferenced; evicted with pools %llu, on storage takeover %llu in total), texture re-uploads %llu in total, per-frame arena blocks created %llu in total, finalized textures still referenced %u (small table, %llu put in total); headroom to the system memory limit %s", frame, rss_mb, gpu, nd, nr, ns, live, pres, (unsigned long long)(pres_b >> 20), (unsigned long long)(pool_b >> 20), peak, cap, dead_n, dead_mb, ashared, aorph, (unsigned long long)g_alias_evicted, (unsigned long long)g_alias_taken, (unsigned long long)g_pkg_reuploads, (unsigned long long)g_arena_made, nghost, (unsigned long long)ghost_puts, avail);
     { void mtl_vc_stats(unsigned *, uint64_t *, uint64_t *), mtl_tb2_stats(uint64_t *, uint64_t *, uint64_t *, uint64_t *, uint64_t *); uint64_t mtl_tex_mis_count(void); unsigned vn; uint64_t vh, vm, tb, tm, tf, tc, tcb;
       mtl_vc_stats(&vn, &vh, &vm); mtl_tb2_stats(&tb, &tm, &tf, &tc, &tcb);
       MLOG("texture views by texture (vc_get): %u textures hold cached views; %llu views reused, %llu made in total; texture buffers bound as 2D rows for wrapped 1D fetches %llu times, %llu made, %llu failed, %llu copied into aligned rows (%llu MB) "
@@ -2949,6 +3008,53 @@ void mtl_mem_stat(unsigned long long frame, unsigned long long rss_mb) {
         MLOG("GPU allocation growth by function: pass end %llu MB, pass begin %llu MB, pipeline fetch %llu MB, argument buffers %llu MB, texture fetch %llu MB", g_ap_fn[0] >> 20, g_ap_fn[1] >> 20, g_ap_fn[2] >> 20, g_ap_fn[3] >> 20, g_ap_fn[4] >> 20); }
     if (g_allocprof > 0) { int top[4] = {-1, -1, -1, -1}; for (int o = 0; o < 64; o++) for (int k = 0; k < 4; k++) if (top[k] < 0 || g_ap_bytes[o] > g_ap_bytes[top[k]]) { for (int j = 3; j > k; j--) top[j] = top[j - 1]; top[k] = o; break; }
         MLOG("GPU allocation growth by op: op%d %llu MB, op%d %llu MB, op%d %llu MB, op%d %llu MB", top[0], g_ap_bytes[top[0]] >> 20, top[1], g_ap_bytes[top[1]] >> 20, top[2], g_ap_bytes[top[2]] >> 20, top[3], g_ap_bytes[top[3]] >> 20); }
+    if (g_allocprof > 0) @autoreleasepool {   // What the residency set holds, by kind, against all of GPU allocated: the rest is alive but not resident (released from the set and still referenced)
+        enum { NB = 24 }; struct { uint32_t key, n; uint64_t bytes; } bk[NB]; int nb = 0; uint64_t rbytes = 0; unsigned robjs = 0;
+        pthread_mutex_lock(&g_res_mu); NSArray *live = g_res_objects.allObjects; pthread_mutex_unlock(&g_res_mu);
+        for (id a in live) {
+            uint64_t sz = ((id<MTLAllocation>)a).allocatedSize; uint32_t key = 3u << 28;   // kind in the top bits: 1 texture (storage, render target, type, pixel format), 2 buffer (storage), 3 heap
+            if ([a conformsToProtocol:@protocol(MTLTexture)]) { id<MTLTexture> t = a; key = 1u << 28 | (uint32_t)t.storageMode << 24 | (t.usage & MTLTextureUsageRenderTarget ? 1u << 20 : 0) | ((uint32_t)t.textureType & 0xf) << 16 | ((uint32_t)t.pixelFormat & 0xffff); }
+            else if ([a conformsToProtocol:@protocol(MTLBuffer)]) key = 2u << 28 | (uint32_t)((id<MTLBuffer>)a).storageMode << 24;
+            rbytes += sz; robjs++;
+            int i = 0; while (i < nb && bk[i].key != key) i++;
+            if (i == nb) { if (nb == NB) continue; bk[nb].key = key; bk[nb].n = 0; bk[nb].bytes = 0; nb++; }
+            bk[i].n++; bk[i].bytes += sz;
+        }
+        char line[640]; int o = 0;
+        for (int k = 0; k < 8 && k < nb && o < (int)sizeof line - 96; k++) {
+            int m = k; for (int j = k + 1; j < nb; j++) if (bk[j].bytes > bk[m].bytes) m = j;
+            typeof(bk[0]) x = bk[m]; bk[m] = bk[k]; bk[k] = x;
+            uint32_t key = x.key; unsigned long long mb = (unsigned long long)(x.bytes >> 20);
+            if (key >> 28 == 1) o += snprintf(line + o, sizeof line - o, "; textures format %u type %u storage %u%s: %u, %llu MB", key & 0xffff, (key >> 16) & 0xf, (key >> 24) & 0xf, key & (1u << 20) ? " render target" : "", x.n, mb);
+            else if (key >> 28 == 2) o += snprintf(line + o, sizeof line - o, "; buffers storage %u: %u, %llu MB", (key >> 24) & 0xf, x.n, mb);
+            else o += snprintf(line + o, sizeof line - o, "; heaps: %u, %llu MB", x.n, mb);
+        }
+        MLOG("GPU allocated by kind: %llu MB in all, %u resident objects %llu MB (not resident %llu MB); readbacks not landed %llu, %llu MB%s", (unsigned long long)(g_dev.currentAllocatedSize >> 20), robjs, (unsigned long long)(rbytes >> 20),
+             (unsigned long long)(g_dev.currentAllocatedSize > rbytes ? (g_dev.currentAllocatedSize - rbytes) >> 20 : 0), (unsigned long long)atomic_load(&g_mrb_live), (unsigned long long)(atomic_load(&g_mrb_live_bytes) >> 20), line);
+        // Taken out of the residency set and still alive, by the line that made each resident: what keeps the rest of GPU allocated
+        struct { uint32_t line, key, n; uint64_t bytes; } rt[NB]; int nr = 0; uint64_t tbytes = 0; unsigned tobjs = 0;
+        pthread_mutex_lock(&g_res_mu); NSArray *gone = g_retired.allObjects; NSMutableArray *lines = [NSMutableArray arrayWithCapacity:gone.count];
+        for (id a in gone) [lines addObject:[g_res_line objectForKey:a] ?: @0];
+        NSSet *res_now = [NSSet setWithArray:g_res_objects.allObjects]; pthread_mutex_unlock(&g_res_mu);
+        for (NSUInteger g = 0; g < gone.count; g++) { id a = gone[g]; if ([res_now containsObject:a]) continue;
+            uint64_t sz = ((id<MTLAllocation>)a).allocatedSize; uint32_t key = 3u << 28, ln = (uint32_t)[lines[g] unsignedIntValue];
+            if ([a conformsToProtocol:@protocol(MTLTexture)]) { id<MTLTexture> t = a; key = 1u << 28 | (t.usage & MTLTextureUsageRenderTarget ? 1u << 20 : 0) | ((uint32_t)t.pixelFormat & 0xffff); }
+            else if ([a conformsToProtocol:@protocol(MTLBuffer)]) key = 2u << 28;
+            tbytes += sz; tobjs++;
+            int i = 0; while (i < nr && (rt[i].line != ln || rt[i].key != key)) i++;
+            if (i == nr) { if (nr == NB) continue; rt[nr].line = ln; rt[nr].key = key; rt[nr].n = 0; rt[nr].bytes = 0; nr++; }
+            rt[i].n++; rt[i].bytes += sz;
+        }
+        o = 0;
+        for (int k = 0; k < 6 && k < nr && o < (int)sizeof line - 96; k++) {
+            int m = k; for (int j = k + 1; j < nr; j++) if (rt[j].bytes > rt[m].bytes) m = j;
+            typeof(rt[0]) x = rt[m]; rt[m] = rt[k]; rt[k] = x;
+            unsigned long long mb = (unsigned long long)(x.bytes >> 20);
+            if (x.key >> 28 == 1) o += snprintf(line + o, sizeof line - o, "; line %u textures format %u%s: %u, %llu MB", x.line, x.key & 0xffff, x.key & (1u << 20) ? " render target" : "", x.n, mb);
+            else o += snprintf(line + o, sizeof line - o, "; line %u %s: %u, %llu MB", x.line, x.key >> 28 == 2 ? "buffers" : "heaps", x.n, mb);
+        }
+        MLOG("GPU objects out of the residency set and still alive: %u, %llu MB%s", tobjs, (unsigned long long)(tbytes >> 20), line);
+    }
 }
 void mtl_pkg_stats(uint64_t *uploads, uint64_t *reuploads) { *uploads = g_pkg_uploads; *reuploads = g_pkg_reuploads; }
 uint64_t mtl_pkg_edge_skips(void) { return g_pkg_edge_skips; }
@@ -10539,6 +10645,7 @@ static void mirror_readback(const tex_t *t, id<MTLTexture> d, unsigned level, un
     res_add(b);
     id<MTL4ComputeCommandEncoder> e = blit();
     for (int z = 0; z < nz; z++) enc_b_copy_texture_buffer(e, d, layer0 + r->zoffset + z, level, MTLOriginMake(r->xoffset, r->yoffset, 0), MTLSizeMake(r->width, r->height, 1), b, (size_t)z * img, row, img);
+    atomic_fetch_add(&g_mrb_live, 1); atomic_fetch_add(&g_mrb_live_bytes, img * nz);
     mirror_rb *m = malloc(sizeof *m); *m = (mirror_rb){*t, level, layer0, *r, row, img, (void *)CFBridgingRetain(b), absorb ? (void *)CFBridgingRetain(d.parentTexture ? d.parentTexture : d) : NULL, rb_copy_shift(t, d)};
     post((post_op){4, NULL, 0, 0, 0, 0, m, 0});
     mrb_note(t->serial, 1);
@@ -10548,6 +10655,7 @@ static void mirror_readback(const tex_t *t, id<MTLTexture> d, unsigned level, un
 }
 static void mirror_rb_land(void *p) {   // the submission's completion handler
     mirror_rb *m = p; id<MTLBuffer> b = CFBridgingRelease(m->buf);
+    atomic_fetch_sub(&g_mrb_live, 1); atomic_fetch_sub(&g_mrb_live_bytes, b.length);
     if (m->shift) { int bw, bh; nvn_fmt_bpb(m->t.d.format, &bw, &bh); rb_swap_rows(b.contents, m->row, (size_t)((m->r.height + bh - 1) / bh), (size_t)(m->r.depth ? m->r.depth : 1), m->row, m->img, m->shift); }   // into the guest's order
     if (nvn_tex_mirror_b2t(&m->t, m->level, m->layer0, &m->r, b.contents, m->row, m->img)) { static int n; if (n++ < 4) MLOG("[RED] GPU copy read back into the storage of texture ser=%llu level %u: not written", (unsigned long long)m->t.serial, m->level);
         if (m->src) CFRelease(m->src); }

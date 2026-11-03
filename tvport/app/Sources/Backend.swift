@@ -26,6 +26,8 @@ struct GameInfo: Codable {
     let version: String
     let sources: [String]
     let prepared: Bool
+    let render_scale: Bool?   // the rewritten game has a render-scale stub (backend.py render_scale_supported)
+    let frame_step: Bool?     // and a frame step, which holds 30 fps while the TV is hot (frame_step_supported)
     let icon: String?
     let team: String?
     let bundle_id: String?

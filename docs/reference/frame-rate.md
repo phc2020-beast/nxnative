@@ -77,6 +77,13 @@ Frame pacing: the host's frame step, engine frame limiters, present intervals an
 - **Check:** `t_nvn` verifies literal 33,333,333 / 16,666,666 ns periods for 30 / 60, display-link targets, disabled frame-step logic for native engines, target zero and movie/state-page precedence. All 134 NVN checks pass with Metal validation.
 - **Found on:** [NieR:Automata iPhone controls](../../dm/games/010056B015FE8000/README.md#iphone-resolution-and-frame-rate-controls).
 
+### A frame-rate target with nothing to change the game's step
+
+- **Symptom:** the game runs too fast. At 60 fps walking and animations are twice their speed, while the game sets present interval 2. It happens on a build the profile was not brought up on, packed from the NSP script's derived profile.
+- **Cause:** with no frame-step page, presentation took the profile's `fps_target` as its cap (the entry above), whether or not an engine limit had been found and set in this main. A main with neither steps its game by the frame the interval gives it.
+- **Fix:** `dm_fps_lock_tick` reports the target it set (`dm_fps_lock_target`). That is 0 when no limit of `hle_fpslock.c` applies to this main, or -1 before the first present. `fps_present_cap` takes the cap only from it or from the frame step; otherwise frames follow the game's own present interval. Every profile with a target has one of the two for the builds it was brought up on, so their presentation is unchanged. The graphics unit tests have no host and keep the profile's target (the weak `dm_fps_lock_target`).
+- **Found on:** [The Legend of Zelda: Tears of the Kingdom](../../dm/games/0100F2C0115B6000/README.md#memory) 1.4.2 on the Apple TV: its `FRAME_STEP` is 1.4.3's, and 59.9 fps of interval-2 frames made Link walk at twice the speed.
+
 ### Resolution policy is independent of the frame-rate cap
 
 - **Symptom:** the game always renders at full resolution, or turning off dynamic resolution still allows the native controller to lower it.

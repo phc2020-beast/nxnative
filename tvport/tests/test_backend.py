@@ -72,6 +72,14 @@ class Jetsam(unittest.TestCase):
             (Path(folder) / 'JetsamEvent-3.ips').write_text('not json')
             self.assertEqual(backend.read_jetsam(Path(folder)), [{'time': '2026-11-02 11:52:39', 'reason': 'per-process-limit', 'mb': 2100}])
 
+    def test_newest_kill_last(self):
+        def report(date): return '{"bug_type":"298"}\n' + json.dumps({'date': date, 'processes': [{'name': 'DmIOS', 'rpages': 134000, 'reason': 'per-process-limit'}]})
+        with tempfile.TemporaryDirectory() as folder:
+            (Path(folder) / 'Retired').mkdir()
+            (Path(folder) / 'JetsamEvent-2026-11-03-090346.ips').write_text(report('2026-11-03 09:03:46.65 -0700'))
+            (Path(folder) / 'Retired/JetsamEvent-2026-11-02-135952.ips').write_text(report('2026-11-02 13:59:52.64 -0700'))
+            self.assertEqual([kill['time'] for kill in backend.read_jetsam(Path(folder))], ['2026-11-02 13:59:52.64 -0700', '2026-11-03 09:03:46.65 -0700'])
+
 
 class Failures(unittest.TestCase):
     def test_the_reason_survives_a_quiet_ending(self):
@@ -385,6 +393,31 @@ class Saves(unittest.TestCase):
             game = self.make_game(folder)
             self.assertIn('DM_TV_PLAYERS=Taylor, Sam\n', backend.write_env(game, 'handheld', 512, ' Taylor,  Sam ').read_text())
             self.assertNotIn('DM_TV_PLAYERS', backend.write_env(game, 'handheld', 512, '').read_text())
+
+    def test_render_scale_reaches_the_app(self):
+        with tempfile.TemporaryDirectory() as folder:
+            game = self.make_game(folder)
+            self.assertIn('DM_RENDER_SCALE=0.75\n', backend.write_env(game, 'handheld', 512, '', 0.75).read_text())
+            self.assertNotIn('DM_RENDER_SCALE', backend.write_env(game, 'handheld', 512, '').read_text())   # full size: the game's own, dynamic resolution included
+            self.assertEqual(backend.render_scale_arg('0.6'), 0.6)
+            with self.assertRaises(Exception): backend.render_scale_arg('0.4')
+
+    def test_render_scale_offered_only_with_the_stub(self):
+        with tempfile.TemporaryDirectory() as folder:
+            game = self.make_game(folder)
+            self.assertFalse(game.render_scale_supported())   # not rewritten yet
+            patched = game.build / 'patched_v720896'; patched.mkdir()
+            (patched / 'main.fixups.tsv').write_text('# FPS_STATE_OFF\t0x3ad4000\n')
+            self.assertFalse(backend.Game(Path(folder)).render_scale_supported())
+            (patched / 'main.fixups.tsv').write_text('# FPS_STATE_OFF\t0x3ad4000\n# RENDER_SCALE\t1\n')
+            self.assertTrue(backend.Game(Path(folder)).render_scale_supported())
+            self.assertTrue(backend.Game(Path(folder)).frame_step_supported())
+
+    def test_thermal_cap_can_be_left_off(self):
+        with tempfile.TemporaryDirectory() as folder:
+            game = self.make_game(folder)
+            self.assertIn('DM_THERMAL_CAP=0\n', backend.write_env(game, 'handheld', 512, '', 1.0, False).read_text())
+            self.assertNotIn('DM_THERMAL_CAP', backend.write_env(game, 'handheld', 512, '').read_text())
 
 
 class FindKeys(unittest.TestCase):

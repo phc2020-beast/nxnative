@@ -39,6 +39,14 @@ PYTHON_VERSION = '3.14'
 REQUIREMENTS = HERE / 'requirements.txt'
 TOOL_PATHS = ['/opt/homebrew/bin', '/usr/local/bin', '/usr/local/share/dotnet', str(Path.home() / '.dotnet')]   # where the NSP script looks too
 TEXTURE_CAPS = (0, 1024, 512, 256)
+
+
+def render_scale_arg(text: str) -> float:
+    """0.5 to 1.0, the range the loader accepts (DM_RENDER_SCALE)"""
+    value = float(text)
+    if not 0.5 <= value <= 1.0:
+        raise argparse.ArgumentTypeError('the render scale is 0.5 to 1.0')
+    return value
 CACHES = 'Library/Caches'
 SHADER_LIST = 'tvport-shaders.tsv'
 SAVE_BACKUPS = 'save-backups'
@@ -213,6 +221,19 @@ class Game:
         patched = sorted(self.build.glob('patched_*')) if self.build else []
         patched = [p for p in patched if p.is_dir()]
         return patched[-1].name[len('patched_'):] if patched else None
+
+    def fixup_declared(self, key: str) -> bool:
+        """Whether the rewritten main's fixups declare `# <key>`, as the iPhone launcher's fixups: conditions read them (dm/games/settings.tsv)"""
+        fixups = self.build / f'patched_{self.package}/main.fixups.tsv' if self.build and self.package else None
+        return bool(fixups and fixups.is_file() and any(line.startswith(f'# {key}\t') or line == f'# {key}' for line in fixups.read_text(errors='replace').splitlines()))
+
+    def render_scale_supported(self) -> bool:
+        """A render-scale stub in the rewritten main (Tears of the Kingdom 1.4.2 / 1.4.3, Breath of the Wild 1.9.0)"""
+        return self.fixup_declared('RENDER_SCALE')
+
+    def frame_step_supported(self) -> bool:
+        """A frame step in the rewritten main (its state page, FPS_STATE_OFF): the host decides each frame's step and holds 30 fps while the device is thermally serious (hle_nvn.c thermal_capped)"""
+        return self.fixup_declared('FPS_STATE_OFF')
 
     @property
     def extract(self) -> Optional[Path]:
@@ -424,7 +445,7 @@ def cmd_inspect(args) -> None:
     profile = provisioning(app)
     team = profile.get('team') or known_team()
     print(json.dumps({'folder': str(game.folder), 'title_id': game.title_id, 'name': game.name() if game.build else game.folder.name, 'version': game.version() if game.build else '',
-                      'sources': game.sources, 'prepared': game.prepared, 'icon': str(game.icon) if game.icon else None, 'team': team,
+                      'sources': game.sources, 'prepared': game.prepared, 'render_scale': game.render_scale_supported() if game.build else False, 'frame_step': game.frame_step_supported() if game.build else False, 'icon': str(game.icon) if game.icon else None, 'team': team,
                       'bundle_id': game.bundle_id(team) if game.build and team else None, 'signing': profile, 'saved': game.state(),
                       'keys': str(find_keys(game) or '') or None, **backup_info(latest_backup(game))}))
 
@@ -576,10 +597,14 @@ def restore_saves(game: Game, device: str, bundle: str) -> int:
     return len(names)
 
 
-def write_env(game: Game, mode: str, texture_cap: int, players: str = '') -> Path:
+def write_env(game: Game, mode: str, texture_cap: int, players: str = '', render_scale: float = 1.0, thermal_cap: bool = True) -> Path:
     """The switches the app reads at launch (main.m, dm/env.txt)."""
     path = game.build / 'tvport-env.txt'
     lines = ['# Written by TVPort', f'DM_OPMODE={0 if mode == "handheld" else 1}', f'DM_BC_MAX_DIM={texture_cap}']
+    if render_scale != 1.0:   # the 3D views at that fraction of the game's size (loader.c dm_fps_state_apply); a game without the stub ignores it
+        lines.append(f'DM_RENDER_SCALE={render_scale:g}')
+    if not thermal_cap:   # the frame step keeps its cap when the TV is hot; tvOS lowers the clocks then all the same (docs/reference/frame-rate.md)
+        lines.append('DM_THERMAL_CAP=0')
     if players.strip():
         lines.append('DM_TV_PLAYERS=' + ' '.join(players.split()))
     path.write_text('\n'.join(lines) + '\n')
@@ -626,7 +651,7 @@ def generate_project(game: Game, args, team: str, bundle: str, python: str) -> P
     restore_tables(game)
     env = profile_env(game)
     env.update(GAME=game.title_id, W=str(game.build), PATCHED=str(game.build / f'patched_{game.package}'), ROMFS=str(game.romfs), MSL_IOS=str(game.shaders), AOC='',
-               DM_TVOS='1', DM_COPY_ROMFS='NO', DM_SHOW_FPS='1' if args.fps else '0', DM_ENV_FILE=str(write_env(game, args.mode, args.texture_cap, args.players)), DM_BUNDLE_ID=bundle, DM_TEAM_ID=team,
+               DM_TVOS='1', DM_COPY_ROMFS='NO', DM_SHOW_FPS='1' if args.fps else '0', DM_ENV_FILE=str(write_env(game, args.mode, args.texture_cap, args.players, args.render_scale, not args.no_thermal_cap)), DM_BUNDLE_ID=bundle, DM_TEAM_ID=team,
                DM_XCODE_PROJECT_DIR=str(game.build / 'tvport-xcode'), DM_XCODE_DERIVED_DATA=str(game.build / 'tvport-derived'), FONT_PY=python)
     art = args.art or game.icon
     if art:
@@ -733,7 +758,7 @@ def cmd_build(args) -> None:
     project = generate_project(game, args, team, bundle, python)
     bundle_shaders(game, project)
     compile_app(game, project, args.device)
-    game.save_state(bundle_id=bundle, art=str(args.art) if args.art else None, mode=args.mode, texture_cap=args.texture_cap)
+    game.save_state(bundle_id=bundle, art=str(args.art) if args.art else None, mode=args.mode, texture_cap=args.texture_cap, render_scale=args.render_scale)
     if args.device:
         install(game, args.device, bundle)
         restored = restore_saves(game, args.device, bundle)
@@ -837,7 +862,7 @@ def read_jetsam(folder: Path, process: str = 'DmIOS') -> list:
         for entry in report.get('processes', []):
             if entry.get('name') == process and entry.get('reason'):
                 kills.append({'time': report.get('date', path.stem), 'reason': entry['reason'], 'mb': entry.get('rpages', 0) * page >> 20})
-    return kills
+    return sorted(kills, key=lambda kill: kill['time'])   # oldest first by the report's own date: the newest can sit beside older ones in Retired/, whose path sorts after it
 
 
 def verdicts(run_log: dict, kills: list) -> list:
@@ -893,6 +918,8 @@ def main() -> int:
     build.add_argument('--art', type=Path)
     build.add_argument('--mode', choices=('handheld', 'docked'), default='handheld')
     build.add_argument('--texture-cap', type=int, choices=TEXTURE_CAPS, default=512)
+    build.add_argument('--render-scale', type=render_scale_arg, default=1.0)
+    build.add_argument('--no-thermal-cap', action='store_true')
     build.add_argument('--fps', action='store_true')
     build.add_argument('--players', default='')
     build.add_argument('--icloud', action='store_true')

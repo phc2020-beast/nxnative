@@ -142,7 +142,11 @@ if [ "$PREPARE_XCODE" = YES ] && [ -n "${DM_ENTITLEMENTS-default}" ]; then
 fi
 # DM_COPY_ROMFS=NO also for the prepared project: its Copy game resources phase (stage_resources.sh) then leaves the game files out and writes the image's identity; Gen/dm.xcconfig is made again by every run
 [ "${DM_COPY_ROMFS:-YES}" != NO ] || [ "$PREPARE_XCODE" != YES ] || echo "DM_COPY_ROMFS = NO" >> Gen/dm.xcconfig
-xcodegen generate -q > /dev/null || die "xcodegen"
+# xcodegen 2.46 globs a source's excludes under the project's absolute path without escaping it, so in a folder whose name has [ ] * ? { } (an NSP folder "… [NSP]") they match nothing
+# and the Apple TV project compiles Launcher.swift and SaveSync.m, which tvOS lacks: generate through a link with a plain name (the project's paths are relative, so nothing keeps the link)
+XG=$(mktemp -d "${TMPDIR:-/tmp}/dm_xcodegen.XXXXXX") && ln -s "$IOS" "$XG/p" || die "xcodegen link"
+xcodegen generate -q --spec "$XG/p/project.yml" --project "$XG/p" > /dev/null; XG_RC=$?
+rm -f "$XG/p"; rmdir "$XG"; [ "$XG_RC" = 0 ] || die "xcodegen"
 # DMCommit / DMChain: the checkout that built the app (+dirty with uncommitted changes to tracked files) and the shader chain it carries, which the host logs at start (main.c)
 COMMIT=$(git -C "$DM" rev-parse --short=12 HEAD 2> /dev/null) && { [ -z "$(git -C "$DM" status --porcelain --untracked-files=no 2> /dev/null)" ] || COMMIT=$COMMIT+dirty
   /usr/libexec/PlistBuddy -c "Add :DMCommit string $COMMIT" Gen/Info.plist > /dev/null || die "DMCommit"; t "source: $COMMIT"; }

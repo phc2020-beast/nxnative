@@ -7,6 +7,8 @@
 //   Classes: guest (the whole guest address space block, including the SetHeapSize heap, alias, stacks; data read from RomFS through pread also lands here), code (embedded / loaded module images),
 //         malloc (host heap), gpu (IOAccelerator / IOSurface / Metal tagged regions), stack, file (file mappings), other
 //   The part where charged ≠ phys_footprint (GPU private memory accounted by IOKit is not in any VM region) is listed separately as "unattributed" = footprint − Σcharged.
+//   Paging, per second since the last line: this process's page faults and page-ins (TASK_EVENTS_INFO), the system's page-outs (HOST_VM_INFO64), the system's free and wired memory, and the guest's dirty
+//         pages (file-backed on tvOS, guest_block: the system writes them to flash before it can take their memory back), so a stall that is the system paging the guest shows as such
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #include <TargetConditionals.h>
@@ -61,7 +63,7 @@ static void sample(FILE *f, double t, id<MTLDevice> dev) {
 #if TARGET_OS_IPHONE
     avail = os_proc_available_memory();
 #endif
-    uint64_t virt[NC] = {0}, res[NC] = {0}, bill[NC] = {0};
+    uint64_t virt[NC] = {0}, res[NC] = {0}, bill[NC] = {0}, gdirty = 0;
     static uint32_t seen[1 << 16]; static uint32_t gen; gen++; if (!gen) { memset(seen, 0, sizeof seen); gen = 1; }   // Objects already counted in this sample (open addressing)
     vm_address_t a = 0; vm_size_t sz; natural_t depth = 0; vm_size_t pg = vm_page_size;
     for (;;) {
@@ -70,6 +72,7 @@ static void sample(FILE *f, double t, id<MTLDevice> dev) {
         if (in.is_submap) { depth++; continue; }
         int c = classify(a, &in);
         virt[c] += sz; res[c] += (uint64_t)in.pages_resident * pg;
+        if (c == C_GUEST) gdirty += (uint64_t)in.pages_dirtied * pg;
         if (!in.external_pager) {                             // File pages are reclaimable and do not count toward footprint
             static uint64_t key[1 << 16];                     // Key = (object id, offset within the object): the pieces of one object split apart by mprotect cover different pages and must not be merged
             uint64_t k = (uint64_t)in.object_id << 32 ^ (in.offset >> 14);
@@ -80,11 +83,19 @@ static void sample(FILE *f, double t, id<MTLDevice> dev) {
         a += sz; continue;
     }
     uint64_t sum = 0; for (int c = 0; c < NC; c++) sum += bill[c];
+    task_events_info_data_t ev; mach_msg_type_number_t en = TASK_EVENTS_INFO_COUNT; vm_statistics64_data_t hs; mach_msg_type_number_t hn = HOST_VM_INFO64_COUNT;
+    int have_ev = task_info(mach_task_self(), TASK_EVENTS_INFO, (task_info_t)&ev, &en) == KERN_SUCCESS, have_hs = host_statistics64(mach_host_self(), HOST_VM_INFO64, (host_info64_t)&hs, &hn) == KERN_SUCCESS;
+    static uint64_t p_faults, p_pageins, p_pageouts; static int primed;
+    uint64_t faults = have_ev ? (uint64_t)ev.faults : 0, pageins = have_ev ? (uint64_t)ev.pageins : 0, pageouts = have_hs ? hs.pageouts : 0;
     fprintf(f, "%.0f\t%llu\t%llu\t%llu\t%llu\t%llu\t%lld\t%lld", t, fp >> 20, avail >> 20, (unsigned long long)(dev.currentAllocatedSize >> 20),
             vi.internal >> 20, vi.compressed >> 20, (vi.ledger_tag_graphics_footprint + vi.ledger_tag_graphics_footprint_compressed) >> 20,
             (long long)(vi.limit_bytes_remaining >> 20));
     for (int c = 0; c < NC; c++) fprintf(f, "\t%llu/%llu/%llu", virt[c] >> 20, res[c] >> 20, bill[c] >> 20);
-    fprintf(f, "\t%llu\t%lld\n", sum >> 20, ((int64_t)fp - (int64_t)sum) >> 20);
+    fprintf(f, "\t%llu\t%lld", sum >> 20, ((int64_t)fp - (int64_t)sum) >> 20);
+    fprintf(f, "\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\n", primed ? (unsigned long long)(faults - p_faults) : 0, primed ? (unsigned long long)(pageins - p_pageins) : 0,
+            primed ? (unsigned long long)(pageouts - p_pageouts) : 0, have_hs ? (unsigned long long)(((uint64_t)hs.free_count * pg) >> 20) : 0, (unsigned long long)(gdirty >> 20),
+            have_hs ? (unsigned long long)(((uint64_t)hs.wire_count * pg) >> 20) : 0);
+    p_faults = faults; p_pageins = pageins; p_pageouts = pageouts; primed = 1;
     fflush(f);
 }
 
@@ -93,7 +104,7 @@ static void *memstat_thread(void *p) {
     if (!f) { LOG("memstat: cannot open %s", (const char *)p); return NULL; }
     fprintf(f, "# unit MiB; kernel accounting internal / compressed / graphics ledger / headroom to the limit; class columns = virtual/resident/charged (deduplicated per object); charged total = Σ private charged; unattributed = phys_footprint − charged total\nseconds\tphys_footprint\tavailable\tmetal_alloc\tinternal\tcompressed\tgraphics\theadroom");
     for (int c = 0; c < NC; c++) fprintf(f, "\t%s", k_cls[c]);
-    fprintf(f, "\tcharged total\tunattributed\n");
+    fprintf(f, "\tcharged total\tunattributed\tfaults/s\tpageins/s\tsystem pageouts/s\tsystem free\tguest dirty\tsystem wired\n");
     id<MTLDevice> dev = MTLCreateSystemDefaultDevice();   // The same device object as the graphics backend (the system default device singleton)
     uint64_t t0 = now_ns();
     const char *ds = getenv("DM_MEMSTAT_DUMP"); int dump_at = ds ? atoi(ds) : -1;
