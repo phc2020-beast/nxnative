@@ -1,3 +1,48 @@
+# TVPort
+
+Play your own Nintendo Switch games on an Apple TV 4K. TVPort is a fork of [nxnative](https://github.com/seedds/nxnative) by seedds. It adds an Apple TV build of the engine and a Mac app that turns a game you own into an Apple TV app and installs it on your TV, with no command line.
+
+Like nxnative, it is not an emulator: the game's own code runs on the Apple chip, and its graphics are rebuilt on Metal. Nothing from any game, and no keys, are in this repository or its releases. The project is not affiliated with Nintendo, Apple or any game publisher. Use it only with games you own and dumped from your own console.
+
+## What TVPort adds
+
+- **An Apple TV build** (tvOS 26 or later; tested on an Apple TV 4K, 3rd generation, A15, tvOS 27.2). The game's memory is backed by a file, which keeps large games under tvOS's 2 GB limit per app ([tvport/README.md](tvport/README.md#getting-past-the-memory-limit)). The A15 has no BC texture formats, so those textures are stored decompressed.
+- **Saves that last.** tvOS can clear an app's caches at any time. Each save is copied to the app's preferences a few seconds after the game saves it, and comes back by itself. The Mac keeps backups too, every 5 minutes while TVPort is open, in iCloud Drive if you like.
+- **"Who's playing?"** Each player on a shared TV gets their own saves. For a game with one save per console, such as Animal Crossing: New Horizons' island, each name is a resident of the same island instead.
+- **The TVPort Mac app.** Pick a folder holding your game's NSP or XCI files and your `prod.keys`, pick your Apple TV, and press **Build & Install**. Settings for render mode, texture detail, 3D resolution, frame rate and heat appear when the game supports them. **Last Run** reads the TV's log and memory reports and says what went wrong in plain words.
+- **Engine fixes found on the TV**, which help every game:
+  - a leak of render-pass readback buffers on game threads;
+  - normal speed for game versions the profile was not made for;
+  - memory pools the GPU stops using are unwired, so tvOS can page them out;
+  - new memory, paging and stall diagnostics.
+
+## Games tested on the Apple TV
+
+| Game | Version | Result |
+|---|---|---|
+| Super Mario Odyssey | 1.3.0 | Plays |
+| Animal Crossing: New Horizons | 1.0.0 | Plays, one shared island for every player |
+| The Legend of Zelda: Tears of the Kingdom | 1.4.2 | Plays at 30 fps in Handheld mode at 75% 3D resolution. Loading screens slow down a lot once the TV gets hot |
+
+Many more games run on iPhone and iPad with nxnative; see the [games table](dm/games/README.md#games). On the Apple TV, a game needs a 64-bit build. Mario Kart 8 Deluxe before update 2.0 is 32-bit, for example, and cannot run.
+
+## Getting started
+
+1. **The Mac:** Apple silicon, with macOS 26.6 or later and Xcode 27.1 (see [Build from the command line](#build-from-the-command-line) below for why 27.1).
+2. **The Apple TV:** an Apple TV 4K with tvOS 26 or later, in developer mode and paired with Xcode (**Window > Devices and Simulators**).
+3. **An Apple ID signed in to Xcode** (**Settings > Accounts**). A free one works, but its installs stop opening after 7 days. **Build & Install** renews them.
+4. **TVPort:** download `TVPort-<version>.zip` from [Releases](https://github.com/68hctmzzjf-svg/TVPort/releases), unzip it and open TVPort.app. It is signed ad hoc and not notarized, so the first time macOS refuses it: open **System Settings > Privacy & Security** and press **Open Anyway**.
+5. **First run:** TVPort sets itself up and lists anything else the Mac needs in **Setup** (Homebrew packages and the .NET SDK).
+6. **Build your game:** add your game's folder and press **Build & Install**. A game's first build takes 30 to 60 minutes. After that a build takes a few minutes.
+
+[tvport/README.md](tvport/README.md) has the details: the design, the memory and save mechanisms, the settings, and the limits.
+
+## Credits
+
+nxnative is by [seedds](https://github.com/seedds/nxnative), under the MIT License ([LICENSE](LICENSE)). TVPort's additions are under the same license.
+
+---
+
 # nxnative
 
 Play your own Nintendo Switch games natively on iPhone and iPad. Bring your game (its NSP files) and your `prod.keys`; one script turns them into an IPA that you sideload.
