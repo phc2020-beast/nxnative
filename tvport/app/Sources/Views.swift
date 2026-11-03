@@ -284,6 +284,11 @@ struct SettingsForm: View {
                     Text("Draws the game's 3D scene at a lower resolution, so the GPU keeps up; menus and text stay sharp. Below Full the size is fixed, in place of the game's own dynamic resolution. Takes effect at the next Build & Install.")
                         .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                 }
+                if let profileFPS = library.info?.fps_target, profileFPS != 0 {
+                    Picker("Frame rate", selection: fpsBinding(profileFPS)) { Text("30 fps").tag(30); Text("Up to 60 fps").tag(60) }
+                    Text("At 30 the TV does half the work, so it heats up more slowly and loads faster, and a game the TV cannot run at 60 is steadier. Up to 60 holds 60 where the TV keeps up and 30 where it does not. Takes effect at the next Build & Install.")
+                        .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                }
                 if library.info?.frame_step == true {
                     Toggle("Hold 30 fps when the Apple TV is hot", isOn: coolBinding)
                     Text("When tvOS reports the TV as hot, it lowers the chip's speed, the GPU to about a third, whatever the game does, and this makes the game hold 30 fps so the TV cools down sooner. Off, the game keeps trying for 60, which it can then rarely reach, and the TV stays hot and slow for longer. Takes effect at the next Build & Install.")
@@ -331,6 +336,10 @@ struct SettingsForm: View {
 
     private var playersBinding: Binding<String> {
         Binding(get: { library.current?.players ?? "" }, set: { value in library.update { $0.players = value } })
+    }
+
+    private func fpsBinding(_ profile: Int) -> Binding<Int> {
+        Binding(get: { library.current?.fpsTarget ?? profile }, set: { value in library.update { $0.fpsTarget = value == profile ? nil : value } })
     }
 
     private var coolBinding: Binding<Bool> {

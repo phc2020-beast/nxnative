@@ -413,6 +413,16 @@ class Saves(unittest.TestCase):
             self.assertTrue(backend.Game(Path(folder)).render_scale_supported())
             self.assertTrue(backend.Game(Path(folder)).frame_step_supported())
 
+    def test_frame_rate_target_reaches_the_app(self):
+        with tempfile.TemporaryDirectory() as folder:
+            game = self.make_game(folder)
+            self.assertIn('DM_FPS_TARGET=30\n', backend.write_env(game, 'handheld', 512, '', 1.0, True, 30).read_text())
+            self.assertNotIn('DM_FPS_TARGET', backend.write_env(game, 'handheld', 512, '').read_text())   # the profile's own
+            self.assertEqual(game.profile_value('fps_target'), '')   # Odyssey's profile has no frame-rate target
+            (game.build / 'profile/0100000000010000').mkdir(parents=True)
+            (game.build / 'profile/0100000000010000/game.tsv').write_text('title_id\t0100000000010000\nfps_target\t60\n')
+            self.assertEqual(backend.Game(Path(folder)).profile_value('fps_target'), '60')   # a derived profile wins
+
     def test_thermal_cap_can_be_left_off(self):
         with tempfile.TemporaryDirectory() as folder:
             game = self.make_game(folder)

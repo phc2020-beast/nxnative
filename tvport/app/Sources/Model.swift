@@ -34,6 +34,7 @@ struct Game: Codable, Identifiable, Hashable {
     var texture: TextureDetail = .medium
     var renderScale: Double?   // the 3D views at this fraction of the game's size, for games with a render-scale stub; nil = full size. Optional: library.json saved before it decodes as is
     var coolWhenHot: Bool?     // frame-step games hold 30 fps while the TV is thermally serious; nil = on (the engine's default)
+    var fpsTarget: Int?        // 30 or 60 in place of the profile's fps_target; nil = the profile's
     var showFPS = true
     var players: String?
     var id: String { folder }
@@ -162,6 +163,7 @@ final class Library: ObservableObject {
         if game.showFPS { arguments.append("--fps") }
         if let scale = game.renderScale, scale < 1, info?.render_scale == true { arguments += ["--render-scale", String(scale)] }
         if game.coolWhenHot == false, info?.frame_step == true { arguments.append("--no-thermal-cap") }
+        if let fps = game.fpsTarget, (info?.fps_target ?? 0) != 0, fps != info?.fps_target { arguments += ["--fps-target", String(fps)] }
         if !team.isEmpty { arguments += ["--team", team] }
         if let keys { arguments += ["--keys", keys] }
         if let players = game.players, !players.isEmpty { arguments += ["--players", players] }

@@ -231,6 +231,16 @@ class Game:
         """A render-scale stub in the rewritten main (Tears of the Kingdom 1.4.2 / 1.4.3, Breath of the Wild 1.9.0)"""
         return self.fixup_declared('RENDER_SCALE')
 
+    def profile_value(self, key: str) -> str:
+        """A key of the game's profile: the derived one the NSP script wrote for a version it was not brought up on, else the repository's (dm/games/<title ID>/game.tsv)"""
+        for tsv in ((self.build / 'profile' / self.title_id / 'game.tsv') if self.build else None, REPO / 'dm/games' / self.title_id / 'game.tsv'):
+            if tsv and tsv.is_file():
+                for line in tsv.read_text(errors='replace').splitlines():
+                    fields = line.split('\t')
+                    if len(fields) >= 2 and fields[0] == key:
+                        return fields[1].strip()
+        return ''
+
     def frame_step_supported(self) -> bool:
         """A frame step in the rewritten main (its state page, FPS_STATE_OFF): the host decides each frame's step and holds 30 fps while the device is thermally serious (hle_nvn.c thermal_capped)"""
         return self.fixup_declared('FPS_STATE_OFF')
@@ -445,7 +455,7 @@ def cmd_inspect(args) -> None:
     profile = provisioning(app)
     team = profile.get('team') or known_team()
     print(json.dumps({'folder': str(game.folder), 'title_id': game.title_id, 'name': game.name() if game.build else game.folder.name, 'version': game.version() if game.build else '',
-                      'sources': game.sources, 'prepared': game.prepared, 'render_scale': game.render_scale_supported() if game.build else False, 'frame_step': game.frame_step_supported() if game.build else False, 'icon': str(game.icon) if game.icon else None, 'team': team,
+                      'sources': game.sources, 'prepared': game.prepared, 'render_scale': game.render_scale_supported() if game.build else False, 'frame_step': game.frame_step_supported() if game.build else False, 'fps_target': int(game.profile_value('fps_target') or 0) if game.title_id else 0, 'icon': str(game.icon) if game.icon else None, 'team': team,
                       'bundle_id': game.bundle_id(team) if game.build and team else None, 'signing': profile, 'saved': game.state(),
                       'keys': str(find_keys(game) or '') or None, **backup_info(latest_backup(game))}))
 
@@ -597,12 +607,14 @@ def restore_saves(game: Game, device: str, bundle: str) -> int:
     return len(names)
 
 
-def write_env(game: Game, mode: str, texture_cap: int, players: str = '', render_scale: float = 1.0, thermal_cap: bool = True) -> Path:
+def write_env(game: Game, mode: str, texture_cap: int, players: str = '', render_scale: float = 1.0, thermal_cap: bool = True, fps_target: int = 0) -> Path:
     """The switches the app reads at launch (main.m, dm/env.txt)."""
     path = game.build / 'tvport-env.txt'
     lines = ['# Written by TVPort', f'DM_OPMODE={0 if mode == "handheld" else 1}', f'DM_BC_MAX_DIM={texture_cap}']
     if render_scale != 1.0:   # the 3D views at that fraction of the game's size (loader.c dm_fps_state_apply); a game without the stub ignores it
         lines.append(f'DM_RENDER_SCALE={render_scale:g}')
+    if fps_target:   # the profile's fps_target replaced (30 or 60): the frame step's cap, or the engine limit the host sets (hle_fpslock.c)
+        lines.append(f'DM_FPS_TARGET={fps_target}')
     if not thermal_cap:   # the frame step keeps its cap when the TV is hot; tvOS lowers the clocks then all the same (docs/reference/frame-rate.md)
         lines.append('DM_THERMAL_CAP=0')
     if players.strip():
@@ -651,7 +663,7 @@ def generate_project(game: Game, args, team: str, bundle: str, python: str) -> P
     restore_tables(game)
     env = profile_env(game)
     env.update(GAME=game.title_id, W=str(game.build), PATCHED=str(game.build / f'patched_{game.package}'), ROMFS=str(game.romfs), MSL_IOS=str(game.shaders), AOC='',
-               DM_TVOS='1', DM_COPY_ROMFS='NO', DM_SHOW_FPS='1' if args.fps else '0', DM_ENV_FILE=str(write_env(game, args.mode, args.texture_cap, args.players, args.render_scale, not args.no_thermal_cap)), DM_BUNDLE_ID=bundle, DM_TEAM_ID=team,
+               DM_TVOS='1', DM_COPY_ROMFS='NO', DM_SHOW_FPS='1' if args.fps else '0', DM_ENV_FILE=str(write_env(game, args.mode, args.texture_cap, args.players, args.render_scale, not args.no_thermal_cap, args.fps_target)), DM_BUNDLE_ID=bundle, DM_TEAM_ID=team,
                DM_XCODE_PROJECT_DIR=str(game.build / 'tvport-xcode'), DM_XCODE_DERIVED_DATA=str(game.build / 'tvport-derived'), FONT_PY=python)
     art = args.art or game.icon
     if art:
@@ -920,6 +932,7 @@ def main() -> int:
     build.add_argument('--texture-cap', type=int, choices=TEXTURE_CAPS, default=512)
     build.add_argument('--render-scale', type=render_scale_arg, default=1.0)
     build.add_argument('--no-thermal-cap', action='store_true')
+    build.add_argument('--fps-target', type=int, choices=(0, 30, 60), default=0)   # 0: the profile's
     build.add_argument('--fps', action='store_true')
     build.add_argument('--players', default='')
     build.add_argument('--icloud', action='store_true')
