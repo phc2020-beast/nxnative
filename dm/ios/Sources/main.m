@@ -113,11 +113,7 @@ const char *front_ios_device_check(void) {
     // This branch (iPad mini 6, A15): the host decodes BC textures on a GPU without them (nvn_mtl.m no_bc, from TVPort), so such a device runs the game instead of being refused.
     // Decoded textures take 4 to 8 times their size: DM_BC_MAX_DIM lowers it
     fprintf(stderr, "boot: this GPU (%s) has no BC texture formats: the host decodes them, DM_BC_MAX_DIM=%s\n", gpu ? gpu.name.UTF8String : "no Metal device", getenv("DM_BC_MAX_DIM") ?: "0 (full detail)");
-    if (1) return NULL;
-    snprintf(msg, sizeof msg, "This device's GPU (%s) cannot read BC-compressed textures, which the games use. It needs an iPhone 15 Pro or newer (A17 Pro chip or later) or an iPad with an M1 chip or later.",
-             gpu ? gpu.name.UTF8String : "no Metal device");
-    fprintf(stderr, "[RED] boot: %s\n", msg);
-    return msg;
+    return NULL;
 }
 static void romfs_identity_report(NSString *doc) {
     romfs_id want, got;

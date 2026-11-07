@@ -9,7 +9,7 @@ REPO=$(cd "$(dirname "$0")/../.." && pwd)
 PY=${PYTHON:-$HOME/.local/nxpython/python/bin/python3}
 [ -x "$PY" ] || PY=python3
 [ -f "$KEYS" ] || { echo "no prod.keys at $KEYS" >&2; exit 1; }
-ls "$GAME"/*.nsp "$GAME"/*.xci "$GAME"/*.nsz 2>/dev/null | grep -q . || { echo "no NSP / XCI files in $GAME" >&2; exit 1; }
+{ ls "$GAME"/*.nsp "$GAME"/*.xci "$GAME"/*.nsz 2>/dev/null || true; } | grep -q . || { echo "no NSP / XCI files in $GAME" >&2; exit 1; }
 [ -d "$HOME/.dotnet" ] && export DOTNET_ROOT=${DOTNET_ROOT:-$HOME/.dotnet} PATH=$HOME/.dotnet:$PATH
 export PATH=/usr/local/bin:$PATH
 "$PY" -c 'import sys; assert sys.version_info >= (3, 12), sys.version' || { echo "$PY is older than Python 3.12" >&2; exit 1; }
