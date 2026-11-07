@@ -23,8 +23,9 @@ static uint8_t *g_as;              // ASLR region base = the whole block
 // tvOS ends an app at about 2.1 GB of footprint, and the Switch gives a game 3.2 GB of its own. Footprint counts anonymous memory, not file pages, so on tvOS the guest's memory is a shared mapping of a
 // sparse file: the system pages it out to flash under pressure, as a swap file, and it stays out of the limit. Measured on an A15: 3.5 GB written took the footprint from 4 to 6 MB, and read back correct
 // at 690 MB/s; mprotect, atomics, zero-copy Metal buffers and residency all work on it. The file loses its name at once, so the system takes its blocks back however the process ends. DM_GUEST_FILE=0 turns it off
+// iPhone and iPad too (TARGET_OS_IPHONE covers iOS and tvOS): an A15 iPad mini 6 has the same 4 GB as the Apple TV, and iOS counts footprint the same way. Untested on an iPad
 static void *guest_block(size_t size) {
-#if TARGET_OS_TV
+#if TARGET_OS_IPHONE
     const char *use = getenv("DM_GUEST_FILE");
     if (!use || strcmp(use, "0")) {
         char path[1024]; snprintf(path, sizeof path, "%s/Library/Caches/guest.bin", getenv("HOME"));

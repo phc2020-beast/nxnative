@@ -165,13 +165,13 @@ static int boot_env(void) {
     if (!getenv("DM_LANG") && [lang isKindOfClass:NSString.class] && lang.length) setenv("DM_LANG", lang.UTF8String, 0);
     fprintf(stderr, "boot: game language %s\n", getenv("DM_LANG") ?: "en-US");
     id<MTLDevice> gpu = MTLCreateSystemDefaultDevice();   // the system default device, the one the graphics layers take (mtl_init repeats this check for the other routes)
-#if !TARGET_OS_TV   // Apple TV 4K: no BC formats, the host decodes them (nvn_mtl.m no_bc)
-    if (!gpu.supportsBCTextureCompression) {
-        snprintf(g_device_message, sizeof g_device_message, "This device's GPU (%s) cannot read BC-compressed textures, which the games use. It needs an iPhone 15 Pro or newer (A17 Pro chip or later) or an iPad with an M1 chip or later.",
-                 gpu ? gpu.name.UTF8String : "no Metal device");
+    // No BC formats (A15 / A16: iPad mini 6, iPhone 13 / 14, Apple TV 4K 3rd generation): the NVN layer decodes them (nvn_mtl.m no_bc), so the game still starts.
+    // The Vulkan and OpenGL layers have no such decoder: their games draw BC textures wrong or not at all on these GPUs
+    if (!gpu) {
+        snprintf(g_device_message, sizeof g_device_message, "This device has no Metal GPU.");
         fprintf(stderr, "[RED] boot: %s\n", g_device_message); return 0;
     }
-#endif
+    if (!gpu.supportsBCTextureCompression) fprintf(stderr, "boot: %s has no BC texture formats: NVN games decode them (more memory and slower loads); Vulkan and OpenGL games may draw wrong\n", gpu.name.UTF8String);
     NSString *romfs = romfs_locate();
     if (!romfs) { romfs_identity_report(doc); fprintf(stderr, "boot: game files not found (Documents/romfs.img, Documents/romfs or <App>/romfs)\n"); return 0; }
     fprintf(stderr, "boot: game files %s\n", romfs.fileSystemRepresentation);
