@@ -1,0 +1,11 @@
+# Breath of the Wild 1.9.0 on an iPad mini 6 (A15, 4 GB RAM). Baked into the app as dm/env.txt; Documents/env.txt on the iPad overrides any line.
+# Handheld mode (1280x720 base), like TVPort's default
+DM_OPMODE=0
+# The A15 has no BC formats, so textures are stored decoded (4 to 8 times bigger): drop mip levels above 512 px (TVPort's "Medium"). 1024 = High, 0 = Full
+DM_BC_MAX_DIM=512
+# 3D scene at 75% (960x540 in handheld): Tears of the Kingdom went from 15 to 30 fps at 75% on the A15 Apple TV
+DM_RENDER_SCALE=0.75
+# Hold 30 fps: steadier on the A15 and cooler (the iPad has no fan)
+DM_FPS_TARGET=30
+# Guest memory in a file (hle_svc.c guest_block): on by default on a 4 GB iPad, written here so the log shows it was asked for
+DM_GUEST_FILE=1
