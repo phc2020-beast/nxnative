@@ -12,10 +12,10 @@ Settings for the iPad are in [`scripts/ipad_a15/botw-env.txt`](../scripts/ipad_a
 ## Build on the Intel Mac (Xcode 26.3)
 
 ```
-python3 scripts/build_ipa_from_nsp.py <folder with the BotW NSPs> -k <prod.keys> \
-  --allow-other-metal --gpu none --romfs separate \
-  --env-file scripts/ipad_a15/botw-env.txt --bundle-id com.michellecarrega.botw
+scripts/ipad_a15/build_botw_ipad.sh            # defaults: ~/Downloads/BotW and ~/Downloads/prod.keys
 ```
+
+It runs `build_ipa_from_nsp.py` with `--allow-other-metal --gpu none --romfs separate --env-file scripts/ipad_a15/botw-env.txt --bundle-id com.michellecarrega.botw`, a build folder of its own (`<NSP folder>/ipad_a15_build`) and its own IPA (`ZeldaBreathOfTheWild-iPad.ipa`), so the iPhone build and its IPA are left alone.
 
 - The shader chain differs from the fork's main, so the first build recompiles every shader.
 - `--romfs separate` keeps the IPA small; run the copy command the script prints once to put the game files on the iPad.
