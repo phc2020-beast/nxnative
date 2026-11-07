@@ -4,6 +4,7 @@
 #include <TargetConditionals.h>
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <sys/sysctl.h>
 #include <errno.h>
 #include <unistd.h>
 #include <unistd.h>
@@ -23,10 +24,17 @@ static uint8_t *g_as;              // ASLR region base = the whole block
 // tvOS ends an app at about 2.1 GB of footprint, and the Switch gives a game 3.2 GB of its own. Footprint counts anonymous memory, not file pages, so on tvOS the guest's memory is a shared mapping of a
 // sparse file: the system pages it out to flash under pressure, as a swap file, and it stays out of the limit. Measured on an A15: 3.5 GB written took the footprint from 4 to 6 MB, and read back correct
 // at 690 MB/s; mprotect, atomics, zero-copy Metal buffers and residency all work on it. The file loses its name at once, so the system takes its blocks back however the process ends. DM_GUEST_FILE=0 turns it off
+// iPad / iPhone (this branch): the same mapping, by default on a device with at most 6 GB of RAM (an iPad mini 6 has 4 GB, where iPadOS ends an app well before the game's 3.2 GB plus
+// its textures). DM_GUEST_FILE=1 turns it on on any iOS device, DM_GUEST_FILE=0 off; a device with more RAM keeps anonymous memory, as before
+#if TARGET_OS_IOS
+static int guest_file_default(void) { uint64_t mem = 0; size_t n = sizeof mem; return !sysctlbyname("hw.memsize", &mem, &n, NULL, 0) && mem && mem <= (6ull << 30); }
+#else
+static int guest_file_default(void) { return 1; }
+#endif
 static void *guest_block(size_t size) {
-#if TARGET_OS_TV
+#if TARGET_OS_IPHONE   // tvOS and iOS
     const char *use = getenv("DM_GUEST_FILE");
-    if (!use || strcmp(use, "0")) {
+    if (use && *use ? strcmp(use, "0") != 0 : guest_file_default()) {
         char path[1024]; snprintf(path, sizeof path, "%s/Library/Caches/guest.bin", getenv("HOME"));
         unlink(path);
         int fd = open(path, O_RDWR | O_CREAT | O_EXCL, 0600);

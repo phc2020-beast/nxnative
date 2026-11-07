@@ -165,13 +165,8 @@ static int boot_env(void) {
     if (!getenv("DM_LANG") && [lang isKindOfClass:NSString.class] && lang.length) setenv("DM_LANG", lang.UTF8String, 0);
     fprintf(stderr, "boot: game language %s\n", getenv("DM_LANG") ?: "en-US");
     id<MTLDevice> gpu = MTLCreateSystemDefaultDevice();   // the system default device, the one the graphics layers take (mtl_init repeats this check for the other routes)
-#if !TARGET_OS_TV   // Apple TV 4K: no BC formats, the host decodes them (nvn_mtl.m no_bc)
-    if (!gpu.supportsBCTextureCompression) {
-        snprintf(g_device_message, sizeof g_device_message, "This device's GPU (%s) cannot read BC-compressed textures, which the games use. It needs an iPhone 15 Pro or newer (A17 Pro chip or later) or an iPad with an M1 chip or later.",
-                 gpu ? gpu.name.UTF8String : "no Metal device");
-        fprintf(stderr, "[RED] boot: %s\n", g_device_message); return 0;
-    }
-#endif
+    // Apple TV 4K and A15 / A16 iPads and iPhones (iPad mini 6): no BC formats, the host decodes them (nvn_mtl.m no_bc). Decoded textures take 4 to 8 times their size: DM_BC_MAX_DIM lowers it
+    if (!gpu.supportsBCTextureCompression) fprintf(stderr, "boot: this GPU (%s) has no BC texture formats: the host decodes them, and DM_BC_MAX_DIM=%s\n", gpu ? gpu.name.UTF8String : "no Metal device", getenv("DM_BC_MAX_DIM") ?: "0 (full detail)");
     NSString *romfs = romfs_locate();
     if (!romfs) { romfs_identity_report(doc); fprintf(stderr, "boot: game files not found (Documents/romfs.img, Documents/romfs or <App>/romfs)\n"); return 0; }
     fprintf(stderr, "boot: game files %s\n", romfs.fileSystemRepresentation);
